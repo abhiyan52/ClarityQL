@@ -4,16 +4,17 @@ import { cn, formatNumber, formatCurrency } from "@/lib/utils";
 
 interface DataTableProps {
   columns: string[];
-  rows: Record<string, unknown>[];
+  rows: Array<Array<string | number>>;
 }
 
 export function DataTable({ columns, rows }: DataTableProps) {
-  const formatValue = (value: unknown, column: string): string => {
+  const formatValue = (value: unknown, columnIndex: number): string => {
     if (value === null || value === undefined) {
       return "—";
     }
 
     if (typeof value === "number") {
+      const column = columns[columnIndex] || "";
       // Check if it's a currency-like column
       const isCurrency =
         column.toLowerCase().includes("revenue") ||
@@ -37,14 +38,14 @@ export function DataTable({ columns, rows }: DataTableProps) {
 
   return (
     <Card className="overflow-hidden">
-      <ScrollArea className="max-h-96">
+      <ScrollArea className="h-[500px]">
         <table className="w-full">
-          <thead className="sticky top-0 bg-muted">
+          <thead className="sticky top-0 bg-muted z-10">
             <tr>
               {columns.map((column) => (
                 <th
                   key={column}
-                  className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground"
+                  className="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider text-muted-foreground border-b"
                 >
                   {column.replace(/_/g, " ")}
                 </th>
@@ -60,9 +61,9 @@ export function DataTable({ columns, rows }: DataTableProps) {
                   i % 2 === 0 ? "bg-background" : "bg-muted/20"
                 )}
               >
-                {columns.map((column) => (
-                  <td key={column} className="whitespace-nowrap px-4 py-3 text-sm">
-                    {formatValue(row[column], column)}
+                {row.map((value, colIndex) => (
+                  <td key={colIndex} className="whitespace-nowrap px-4 py-3 text-sm">
+                    {formatValue(value, colIndex)}
                   </td>
                 ))}
               </tr>

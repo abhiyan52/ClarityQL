@@ -1,9 +1,10 @@
-import { Plus, MessageSquare, Trash2, PanelLeftClose } from "lucide-react";
+import { Plus, MessageSquare, Trash2, PanelLeftClose, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
+import { useAuth } from "@/contexts/AuthContext";
 
 interface SidebarProps {
   isOpen: boolean;
@@ -18,6 +19,8 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
     setCurrentConversation,
     deleteConversation,
   } = useChatStore();
+
+  const { user, logout } = useAuth();
 
   const handleNewChat = () => {
     createConversation();
@@ -81,7 +84,19 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
 
       {/* Footer */}
       <Separator />
-      <div className="p-4">
+      <div className="p-4 space-y-3">
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-muted-foreground truncate">{user?.email}</span>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-6 w-6"
+            onClick={logout}
+            title="Logout"
+          >
+            <LogOut className="h-3 w-3" />
+          </Button>
+        </div>
         <p className="text-xs text-muted-foreground">
           ClarityQL v0.1.0
         </p>

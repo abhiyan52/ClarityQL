@@ -12,6 +12,11 @@ export function ChatMessage({ message }: ChatMessageProps) {
   const isUser = message.role === "user";
   const isLoading = message.isLoading;
 
+  // Convert timestamp to Date if it's a string (from localStorage)
+  const timestamp = typeof message.timestamp === 'string' 
+    ? new Date(message.timestamp) 
+    : message.timestamp;
+
   return (
     <div
       className={cn(
@@ -35,7 +40,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
             {isUser ? "You" : "ClarityQL"}
           </span>
           <span className="text-xs text-muted-foreground">
-            {message.timestamp.toLocaleTimeString()}
+            {timestamp.toLocaleTimeString()}
           </span>
           {message.response?.intent && (
             <span

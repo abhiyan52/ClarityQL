@@ -37,7 +37,7 @@ export function ExplanationPanel({ ast, explanation }: ExplanationPanelProps) {
     {
       icon: Grid3X3,
       title: "Grouped By",
-      items: explanation?.groupBy || ast?.dimensions.map((d) => d.field) || [],
+      items: explanation?.group_by || ast?.dimensions.map((d) => d.field) || [],
       color: "text-green-500",
     },
     {
@@ -51,7 +51,7 @@ export function ExplanationPanel({ ast, explanation }: ExplanationPanelProps) {
     {
       icon: ArrowUpDown,
       title: "Ordered By",
-      items: explanation?.orderBy || ast?.order_by.map(
+      items: explanation?.order_by || ast?.order_by.map(
         (o) => `${o.field} ${o.direction.toUpperCase()}`
       ) || [],
       color: "text-purple-500",
@@ -59,7 +59,7 @@ export function ExplanationPanel({ ast, explanation }: ExplanationPanelProps) {
     {
       icon: Database,
       title: "Source Tables",
-      items: explanation?.sourceTables || [],
+      items: explanation?.source_tables || [],
       color: "text-cyan-500",
     },
   ];

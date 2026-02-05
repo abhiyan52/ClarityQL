@@ -32,11 +32,12 @@ export interface QueryAST {
 
 export interface QueryExplanation {
   aggregates: string[];
-  groupBy: string[];
+  group_by: string[];
   filters: string[];
-  orderBy: string[];
+  order_by: string[];
   limit: number | null;
-  sourceTables: string[];
+  source_tables: string[];
+  natural_language?: string | null;
 }
 
 export interface QueryResult {
@@ -46,13 +47,13 @@ export interface QueryResult {
 }
 
 export interface NLQResponse {
-  success: boolean;
-  query: string;
-  ast?: QueryAST;
-  sql?: string;
-  results?: QueryResult;
-  explanation?: QueryExplanation;
-  error?: string;
+  conversation_id: string;
+  ast: QueryAST;
+  explainability: QueryExplanation;
+  visualization: VisualizationSpec;
+  sql: string;
+  columns: string[];
+  rows: Array<Array<string | number>>;
   intent?: "refine" | "reset";
   merged?: boolean;
 }
@@ -87,4 +88,15 @@ export interface ChartConfig {
   xAxis?: string;
   yAxis?: string;
   colorBy?: string;
+}
+
+// Visualization Types (backend-driven)
+
+export type VisualizationType = "table" | "bar" | "line" | "multi-line" | "kpi";
+
+export interface VisualizationSpec {
+  type: VisualizationType;
+  x: string | null;
+  y: string | null;
+  series: string | null;
 }

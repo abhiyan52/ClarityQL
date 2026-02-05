@@ -11,71 +11,13 @@ export function SQLPreview({ sql }: SQLPreviewProps) {
   const [copied, setCopied] = useState(false);
 
   const handleCopy = async () => {
-    await navigator.clipboard.writeText(sql);
+    // Copy the original SQL without HTML formatting
+    const tempDiv = document.createElement("div");
+    tempDiv.innerHTML = sql;
+    const plainText = tempDiv.textContent || tempDiv.innerText || sql;
+    await navigator.clipboard.writeText(plainText);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
-  };
-
-  // Simple SQL syntax highlighting
-  const highlightSQL = (sql: string) => {
-    const keywords = [
-      "SELECT",
-      "FROM",
-      "WHERE",
-      "AND",
-      "OR",
-      "ORDER BY",
-      "GROUP BY",
-      "HAVING",
-      "LIMIT",
-      "OFFSET",
-      "JOIN",
-      "LEFT",
-      "RIGHT",
-      "INNER",
-      "OUTER",
-      "ON",
-      "AS",
-      "DESC",
-      "ASC",
-      "DISTINCT",
-      "COUNT",
-      "SUM",
-      "AVG",
-      "MIN",
-      "MAX",
-      "BETWEEN",
-      "IN",
-      "LIKE",
-      "IS",
-      "NULL",
-      "NOT",
-    ];
-
-    let highlighted = sql;
-
-    // Highlight keywords
-    keywords.forEach((keyword) => {
-      const regex = new RegExp(`\\b${keyword}\\b`, "gi");
-      highlighted = highlighted.replace(
-        regex,
-        `<span class="text-blue-500 font-medium">${keyword}</span>`
-      );
-    });
-
-    // Highlight strings
-    highlighted = highlighted.replace(
-      /'([^']*)'/g,
-      `<span class="text-green-500">'$1'</span>`
-    );
-
-    // Highlight numbers
-    highlighted = highlighted.replace(
-      /\b(\d+\.?\d*)\b/g,
-      `<span class="text-orange-500">$1</span>`
-    );
-
-    return highlighted;
   };
 
   return (
@@ -91,10 +33,10 @@ export function SQLPreview({ sql }: SQLPreviewProps) {
         </Button>
       </CardHeader>
       <CardContent>
-        <pre className="overflow-x-auto rounded-lg bg-muted p-4 text-sm">
-          <code
-            dangerouslySetInnerHTML={{ __html: highlightSQL(sql) }}
-          />
+        <pre className="overflow-x-auto rounded-lg bg-muted p-4 text-sm font-mono">
+          <code className="text-foreground whitespace-pre-wrap break-words">
+            {sql}
+          </code>
         </pre>
       </CardContent>
     </Card>

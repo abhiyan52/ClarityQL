@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Table, BarChart3, Code, Info } from "lucide-react";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent } from "@/components/ui/card";
 import { DataTable } from "./DataTable";
 import { ResultChart } from "./ResultChart";
 import { SQLPreview } from "./SQLPreview";
@@ -15,26 +15,29 @@ interface ResultsPanelProps {
 export function ResultsPanel({ response }: ResultsPanelProps) {
   const [activeTab, setActiveTab] = useState("table");
 
-  if (!response.success) {
-    return (
-      <Card className="mt-4 border-destructive/50 bg-destructive/5">
-        <CardHeader className="pb-2">
-          <CardTitle className="text-sm font-medium text-destructive">
-            Error
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm text-destructive">{response.error}</p>
-        </CardContent>
-      </Card>
-    );
-  }
+  const hasResults = response.rows && response.rows.length > 0;
 
-  const hasResults = response.results && response.results.rows.length > 0;
+  // Check if there is at least one truly numeric column (not dates/strings)
+  const hasNumericColumn = hasResults && response.columns.some((_, colIdx) => {
+    let numericCount = 0;
+    let total = 0;
+    for (const row of response.rows) {
+      const val = row[colIdx];
+      if (val === null || val === undefined || val === "") continue;
+      total++;
+      if (typeof val === "number" || (typeof val === "string" && val.trim() !== "" && !isNaN(Number(val.trim())) && isFinite(Number(val.trim())))) {
+        numericCount++;
+      }
+    }
+    return total > 0 && numericCount / total >= 0.8;
+  });
+
+  // Chart is available when we have at least 2 columns, some data, AND at least one numeric column
   const canChart =
     hasResults &&
-    response.results!.columns.length >= 2 &&
-    response.results!.rows.length > 1;
+    response.columns.length >= 2 &&
+    response.rows.length > 1 &&
+    hasNumericColumn;
 
   return (
     <div className="mt-4 space-y-4">
@@ -62,10 +65,7 @@ export function ResultsPanel({ response }: ResultsPanelProps) {
 
         <TabsContent value="table" className="mt-4">
           {hasResults ? (
-            <DataTable
-              columns={response.results!.columns}
-              rows={response.results!.rows}
-            />
+            <DataTable columns={response.columns} rows={response.rows} />
           ) : (
             <EmptyResults />
           )}
@@ -74,8 +74,8 @@ export function ResultsPanel({ response }: ResultsPanelProps) {
         {canChart && (
           <TabsContent value="chart" className="mt-4">
             <ResultChart
-              columns={response.results!.columns}
-              rows={response.results!.rows}
+              columns={response.columns}
+              rows={response.rows}
             />
           </TabsContent>
         )}
@@ -87,7 +87,7 @@ export function ResultsPanel({ response }: ResultsPanelProps) {
         <TabsContent value="explain" className="mt-4">
           <ExplanationPanel
             ast={response.ast}
-            explanation={response.explanation}
+            explanation={response.explainability}
           />
         </TabsContent>
       </Tabs>
@@ -95,7 +95,7 @@ export function ResultsPanel({ response }: ResultsPanelProps) {
       {/* Row count */}
       {hasResults && (
         <p className="text-xs text-muted-foreground">
-          Showing {response.results!.rows.length} of {response.results!.rowCount} rows
+          Showing {response.rows.length} rows
         </p>
       )}
     </div>

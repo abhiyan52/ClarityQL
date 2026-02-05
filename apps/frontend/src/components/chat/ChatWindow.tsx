@@ -53,21 +53,33 @@ export function ChatWindow() {
     setLoading(true);
 
     try {
+      // Get the last assistant message's backend conversation_id if it exists
+      const lastAssistantMessage = messages
+        .filter(m => m.role === 'assistant' && m.response)
+        .pop();
+      const backendConversationId = lastAssistantMessage?.response?.conversation_id;
+
       const response = await sendQuery({
         query: content,
-        conversation_id: currentConversationId!,
+        conversation_id: backendConversationId,
       });
 
       updateMessage(assistantId, {
-        content: response.success
-          ? "Here are your results:"
-          : `I encountered an error: ${response.error}`,
+        content: "Here are your results:",
         response,
         isLoading: false,
       });
     } catch (error) {
+      let errorMessage = "Please try again.";
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === "string") {
+        errorMessage = error;
+      } else if (error && typeof error === "object") {
+        errorMessage = JSON.stringify(error);
+      }
       updateMessage(assistantId, {
-        content: `Sorry, I couldn't process your request. ${error instanceof Error ? error.message : "Please try again."}`,
+        content: `Sorry, I couldn't process your request. ${errorMessage}`,
         isLoading: false,
       });
     } finally {

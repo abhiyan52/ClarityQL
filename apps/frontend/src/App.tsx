@@ -1,16 +1,42 @@
-import { useState } from "react";
-import Dashboard from "./pages/Dashboard";
-import Login from "./pages/Login";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { AuthProvider } from "@/contexts/AuthContext";
+import { ProtectedRoute } from "@/components/auth/ProtectedRoute";
+import { LoginPage } from "@/pages/LoginPage";
+import { RegisterPage } from "@/pages/RegisterPage";
+import { MainPage } from "@/pages/MainPage";
 
-const App = () => {
-  const [isAuthenticated] = useState(false);
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60 * 5, // 5 minutes
+      retry: 1,
+    },
+  },
+});
 
+function App() {
   return (
-    <div style={{ fontFamily: "system-ui, sans-serif", padding: "2rem" }}>
-      <h1>ClarityQL</h1>
-      {isAuthenticated ? <Dashboard /> : <Login />}
-    </div>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <AuthProvider>
+          <Routes>
+            <Route path="/login" element={<LoginPage />} />
+            <Route path="/register" element={<RegisterPage />} />
+            <Route
+              path="/"
+              element={
+                <ProtectedRoute>
+                  <MainPage />
+                </ProtectedRoute>
+              }
+            />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </AuthProvider>
+      </BrowserRouter>
+    </QueryClientProvider>
   );
-};
+}
 
 export default App;

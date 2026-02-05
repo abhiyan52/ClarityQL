@@ -8,14 +8,15 @@ requires-python = ">=3.11"
 dependencies = [
   "fastapi",
   "uvicorn",
-  "pydantic",
+  "pydantic[email]",
   "pydantic-settings",
   "httpx",
   "pytest",
   "ruff",
   "black",
-  "sqlalchemy",
+  "sqlalchemy[asyncio]",
   "psycopg",
+  "asyncpg",
   "faker",
   # LangChain LLM integrations
   "langchain-core",
@@ -25,6 +26,9 @@ dependencies = [
   # CLI utilities
   "rich",
   "python-dotenv",
+  # Auth
+  "python-jose[cryptography]",
+  "bcrypt>=4.0.0,<5.0.0",
 ]
 
 [tool.uv]

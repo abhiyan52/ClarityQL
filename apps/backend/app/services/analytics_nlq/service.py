@@ -1,221 +1,146 @@
-"""Service layer for analytics NLQ processing."""
+"""
+NLQ Analytics Service.
 
-from dataclasses import dataclass, field
+Orchestrates the full NLQ pipeline with conversational memory:
+1. Load previous AST (if conversation exists)
+2. Classify intent (REFINE/RESET)
+3. Parse query to AST
+4. Merge AST if REFINE
+5. Validate AST
+6. Resolve joins
+7. Compile SQL
+8. Execute query
+9. Persist AST
+10. Return results with explainability
+"""
 
-from langchain_core.language_models import BaseChatModel
+from dataclasses import dataclass
+from typing import Any
+from uuid import UUID
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.core.conversation import (
-    ConversationStateManager,
     IntentClassifier,
     QueryIntent,
-    get_state_manager,
     merge_ast,
 )
-from packages.core.safety.validator import ASTValidationError, ASTValidator
+from packages.core.explainability import ExplainabilityBuilder
+from packages.core.safety.validator import ASTValidator
 from packages.core.schema_registry.registry import SchemaRegistry, get_default_registry
-from packages.core.sql_ast.join_resolver import JoinPlan, JoinResolutionError, JoinResolver
+from packages.core.sql_ast.compiler import SQLCompiler
+from packages.core.sql_ast.join_resolver import JoinPlan, JoinResolver
 from packages.core.sql_ast.models import QueryAST
+from packages.core.viz_inference import VisualizationSpec, infer_visualization
 from packages.llm.factory import LLMFactory
-from packages.llm.parser import NLQParseError, NLQParser
+from packages.llm.parser import NLQParser
 
-
-# -----------------------------
-# Result Types
-# -----------------------------
+from app.models.conversation import Conversation
+from app.models.conversation_state import ConversationState
+from app.services.analytics_nlq.execution import (
+    ExecutionResult,
+    execute_query,
+    get_sql_string,
+)
 
 
 @dataclass
-class NLQProcessingResult:
-    """Result of processing an NLQ query."""
+class NLQResult:
+    """Complete result of NLQ processing."""
 
     success: bool
+    conversation_id: UUID
     ast: QueryAST | None = None
     join_plan: JoinPlan | None = None
+    sql: str | None = None
+    execution_result: ExecutionResult | None = None
+    explainability: dict | None = None
+    visualization: VisualizationSpec | None = None
+    intent: QueryIntent | None = None
+    merged: bool = False
     error: str | None = None
     error_type: str | None = None
-    # Conversation context
-    intent: QueryIntent | None = None
-    previous_ast: QueryAST | None = None
-    merged: bool = False
 
 
-# -----------------------------
-# Service
-# -----------------------------
-
-
-class AnalyticsNLQService:
+class NLQService:
     """
-    Service for processing natural language analytics queries.
+    Service for processing NLQ queries with conversational memory.
 
-    Orchestrates the full pipeline:
-    1. Parse NLQ to QueryAST (via LLM)
-    2. Validate the AST against schema
-    3. Resolve required joins
+    This service orchestrates the full pipeline from natural language
+    to executed SQL results, maintaining conversation state in the database.
     """
 
     def __init__(
         self,
         registry: SchemaRegistry | None = None,
-        parser: NLQParser | None = None,
-        validator: ASTValidator | None = None,
-        resolver: JoinResolver | None = None,
+        sqlalchemy_tables: dict | None = None,
     ):
         """
-        Initialize the service.
-
-        All dependencies can be injected for testing. Uses defaults if not provided.
-        """
-        self._registry = registry or get_default_registry()
-        self._parser = parser or NLQParser(registry=self._registry)
-        self._validator = validator or ASTValidator(registry=self._registry)
-        self._resolver = resolver or JoinResolver(registry=self._registry)
-
-    def process_query(self, query: str) -> NLQProcessingResult:
-        """
-        Process a natural language query through the full pipeline.
+        Initialize the NLQ service.
 
         Args:
-            query: The user's natural language query.
-
-        Returns:
-            NLQProcessingResult with success status and either
-            the processed AST/JoinPlan or error information.
+            registry: Schema registry for field metadata.
+            sqlalchemy_tables: Dict of SQLAlchemy Table objects for compilation.
         """
-        # Step 1: Parse NLQ to AST
-        try:
-            ast = self._parser.parse(query)
-        except NLQParseError as e:
-            return NLQProcessingResult(
-                success=False,
-                error=str(e),
-                error_type="parse_error",
-            )
+        self._registry = registry or get_default_registry()
+        self._llm = LLMFactory.create_from_settings()
+        self._parser = NLQParser(registry=self._registry, llm=self._llm)
+        self._validator = ASTValidator(registry=self._registry)
+        self._resolver = JoinResolver(registry=self._registry)
+        self._classifier = IntentClassifier(llm=self._llm)
+        self._explainability = ExplainabilityBuilder()
 
-        # Step 2: Validate AST
-        try:
-            self._validator.validate(ast)
-        except ASTValidationError as e:
-            return NLQProcessingResult(
-                success=False,
-                ast=ast,
-                error=str(e),
-                error_type="validation_error",
-            )
-
-        # Step 3: Resolve joins
-        try:
-            join_plan = self._resolver.resolve(ast)
-        except JoinResolutionError as e:
-            return NLQProcessingResult(
-                success=False,
-                ast=ast,
-                error=str(e),
-                error_type="join_resolution_error",
-            )
-
-        return NLQProcessingResult(
-            success=True,
-            ast=ast,
-            join_plan=join_plan,
+        # SQLAlchemy tables for compilation
+        self._tables = sqlalchemy_tables or self._create_default_tables()
+        self._compiler = SQLCompiler(
+            sqlalchemy_tables=self._tables,
+            registry=self._registry,
         )
 
-    def parse_only(self, query: str) -> QueryAST:
-        """
-        Parse a query without validation or join resolution.
-
-        Useful for debugging or when you want to handle
-        validation separately.
-
-        Args:
-            query: The user's natural language query.
-
-        Returns:
-            The parsed QueryAST.
-
-        Raises:
-            NLQParseError: If parsing fails.
-        """
-        return self._parser.parse(query)
-
-
-# -----------------------------
-# Conversational Service
-# -----------------------------
-
-
-class ConversationalNLQService:
-    """
-    NLQ service with conversational memory.
-
-    Enables follow-up queries to refine previous results by:
-    1. Classifying intent (REFINE vs RESET)
-    2. Merging delta AST with previous context
-    3. Storing merged AST for future queries
-
-    AST is the single source of truth for conversation state.
-    """
-
-    def __init__(
-        self,
-        registry: SchemaRegistry | None = None,
-        parser: NLQParser | None = None,
-        validator: ASTValidator | None = None,
-        resolver: JoinResolver | None = None,
-        state_manager: ConversationStateManager | None = None,
-        llm: BaseChatModel | None = None,
-    ):
-        """
-        Initialize the conversational service.
-
-        All dependencies can be injected for testing.
-        """
-        self._registry = registry or get_default_registry()
-        self._llm = llm or LLMFactory.create_from_settings()
-        self._parser = parser or NLQParser(registry=self._registry, llm=self._llm)
-        self._validator = validator or ASTValidator(registry=self._registry)
-        self._resolver = resolver or JoinResolver(registry=self._registry)
-        self._state = state_manager or get_state_manager()
-        self._classifier = IntentClassifier(llm=self._llm)
-
-    def process_query(
+    async def process_query(
         self,
         query: str,
-        conversation_id: str,
-    ) -> NLQProcessingResult:
+        user_id: UUID,
+        session: AsyncSession,
+        conversation_id: UUID | None = None,
+    ) -> NLQResult:
         """
-        Process a query with conversational context.
+        Process a natural language query with full pipeline.
 
         Args:
             query: The user's natural language query.
-            conversation_id: Unique identifier for the conversation.
+            user_id: The authenticated user's ID.
+            session: Async database session.
+            conversation_id: Optional existing conversation ID.
 
         Returns:
-            NLQProcessingResult with the merged AST and context info.
+            NLQResult with all processing results.
         """
-        # Step 1: Load previous context
-        previous_ast = self._state.get(conversation_id)
+        # Step 1: Get or create conversation
+        conversation, previous_ast = await self._get_or_create_conversation(
+            session, user_id, conversation_id
+        )
 
         # Step 2: Classify intent
         try:
             intent = self._classifier.classify(query, previous_ast)
         except Exception:
-            # On classification failure, default to RESET
             intent = QueryIntent.RESET
 
-        # Step 3: Parse the query
+        # Step 3: Parse query to AST
         try:
             parsed_ast = self._parser.parse(query)
-        except NLQParseError as e:
-            return NLQProcessingResult(
+        except Exception as e:
+            return NLQResult(
                 success=False,
+                conversation_id=conversation.id,
+                intent=intent,
                 error=str(e),
                 error_type="parse_error",
-                intent=intent,
-                previous_ast=previous_ast,
             )
 
-        # Step 4: Merge or reset based on intent
+        # Step 4: Merge if REFINE
         merged = False
         final_ast = parsed_ast
 
@@ -224,80 +149,294 @@ class ConversationalNLQService:
                 final_ast = merge_ast(previous_ast, parsed_ast)
                 merged = True
             except Exception:
-                # Merge failed - fall back to parsed AST
                 final_ast = parsed_ast
                 merged = False
 
-        # Step 5: Validate the final AST
+        # Step 5: Validate AST
         validation_error = self._validator.validate(final_ast)
         if validation_error:
-            # If merged AST is invalid, try falling back to parsed AST
+            # Try fallback to parsed AST if merge caused issues
             if merged:
                 fallback_error = self._validator.validate(parsed_ast)
                 if fallback_error is None:
                     final_ast = parsed_ast
                     merged = False
                 else:
-                    return NLQProcessingResult(
+                    return NLQResult(
                         success=False,
+                        conversation_id=conversation.id,
                         ast=final_ast,
+                        intent=intent,
+                        merged=merged,
                         error=validation_error,
                         error_type="validation_error",
-                        intent=intent,
-                        previous_ast=previous_ast,
-                        merged=merged,
                     )
             else:
-                return NLQProcessingResult(
+                return NLQResult(
                     success=False,
+                    conversation_id=conversation.id,
                     ast=final_ast,
+                    intent=intent,
+                    merged=merged,
                     error=validation_error,
                     error_type="validation_error",
-                    intent=intent,
-                    previous_ast=previous_ast,
-                    merged=merged,
                 )
 
         # Step 6: Resolve joins
         try:
             join_plan = self._resolver.resolve(final_ast)
-        except JoinResolutionError as e:
-            return NLQProcessingResult(
+        except Exception as e:
+            return NLQResult(
                 success=False,
+                conversation_id=conversation.id,
                 ast=final_ast,
+                intent=intent,
+                merged=merged,
                 error=str(e),
                 error_type="join_resolution_error",
-                intent=intent,
-                previous_ast=previous_ast,
-                merged=merged,
             )
 
-        # Step 7: Store the final AST for future queries
-        self._state.set(conversation_id, final_ast)
+        # Step 7: Compile SQL
+        try:
+            statement = self._compiler.compile(final_ast, join_plan)
+            sql_string = get_sql_string(statement)
+        except Exception as e:
+            return NLQResult(
+                success=False,
+                conversation_id=conversation.id,
+                ast=final_ast,
+                join_plan=join_plan,
+                intent=intent,
+                merged=merged,
+                error=str(e),
+                error_type="compilation_error",
+            )
 
-        return NLQProcessingResult(
+        # Step 8: Execute query
+        try:
+            execution_result = await execute_query(session, statement)
+        except Exception as e:
+            return NLQResult(
+                success=False,
+                conversation_id=conversation.id,
+                ast=final_ast,
+                join_plan=join_plan,
+                sql=sql_string,
+                intent=intent,
+                merged=merged,
+                error=str(e),
+                error_type="execution_error",
+            )
+
+        # Step 9: Build explainability
+        explanation = self._explainability.build(final_ast, join_plan)
+
+        # Step 10: Infer visualization from AST
+        visualization = infer_visualization(final_ast, self._registry)
+
+        # Step 11: Persist AST
+        await self._save_conversation_state(session, conversation.id, final_ast)
+
+        return NLQResult(
             success=True,
+            conversation_id=conversation.id,
             ast=final_ast,
             join_plan=join_plan,
+            sql=sql_string,
+            execution_result=execution_result,
+            explainability=explanation.to_dict(),
+            visualization=visualization,
             intent=intent,
-            previous_ast=previous_ast,
             merged=merged,
         )
 
-    def clear_context(self, conversation_id: str) -> None:
-        """Clear the conversation context."""
-        self._state.clear(conversation_id)
+    async def reset_conversation(
+        self,
+        conversation_id: UUID,
+        user_id: UUID,
+        session: AsyncSession,
+    ) -> bool:
+        """
+        Reset a conversation by clearing its state.
 
-    def get_context(self, conversation_id: str) -> QueryAST | None:
-        """Get the current context for a conversation."""
-        return self._state.get(conversation_id)
+        Args:
+            conversation_id: The conversation to reset.
+            user_id: The user making the request (for ownership check).
+            session: Database session.
+
+        Returns:
+            True if reset successful, False if conversation not found.
+
+        Raises:
+            PermissionError: If user doesn't own the conversation.
+        """
+        # Fetch conversation with ownership check
+        result = await session.execute(
+            select(Conversation).where(Conversation.id == conversation_id)
+        )
+        conversation = result.scalar_one_or_none()
+
+        if conversation is None:
+            return False
+
+        if conversation.user_id != user_id:
+            raise PermissionError("Not authorized to access this conversation")
+
+        # Delete state
+        state_result = await session.execute(
+            select(ConversationState).where(
+                ConversationState.conversation_id == conversation_id
+            )
+        )
+        state = state_result.scalar_one_or_none()
+
+        if state:
+            await session.delete(state)
+
+        return True
+
+    async def _get_or_create_conversation(
+        self,
+        session: AsyncSession,
+        user_id: UUID,
+        conversation_id: UUID | None,
+    ) -> tuple[Conversation, QueryAST | None]:
+        """
+        Get existing conversation or create new one.
+        
+        Args:
+            session: Database session.
+            user_id: The user's ID.
+            conversation_id: Optional conversation ID to continue.
+            
+        Returns:
+            Tuple of (conversation, previous_ast).
+            
+        Raises:
+            PermissionError: If conversation_id is provided but doesn't exist
+                           or doesn't belong to the user.
+        """
+        if conversation_id:
+            # Fetch existing conversation
+            result = await session.execute(
+                select(Conversation)
+                .where(Conversation.id == conversation_id)
+            )
+            conversation = result.scalar_one_or_none()
+
+            # Check if conversation exists
+            if conversation is None:
+                raise PermissionError(
+                    f"Conversation {conversation_id} not found"
+                )
+            
+            # Check if user owns the conversation
+            if conversation.user_id != user_id:
+                raise PermissionError(
+                    "Not authorized to access this conversation"
+                )
+
+            # Load previous AST
+            state_result = await session.execute(
+                select(ConversationState).where(
+                    ConversationState.conversation_id == conversation_id
+                )
+            )
+            state = state_result.scalar_one_or_none()
+
+            if state and state.ast_json:
+                try:
+                    previous_ast = QueryAST.model_validate(state.ast_json)
+                    return conversation, previous_ast
+                except Exception:
+                    pass
+
+            return conversation, None
+
+        # Create new conversation
+        conversation = Conversation(user_id=user_id)
+        session.add(conversation)
+        await session.flush()
+
+        return conversation, None
+
+    async def _save_conversation_state(
+        self,
+        session: AsyncSession,
+        conversation_id: UUID,
+        ast: QueryAST,
+    ) -> None:
+        """Save AST to conversation state."""
+        # Check if state exists
+        result = await session.execute(
+            select(ConversationState).where(
+                ConversationState.conversation_id == conversation_id
+            )
+        )
+        state = result.scalar_one_or_none()
+
+        ast_dict = ast.model_dump(mode="json")
+
+        if state:
+            state.ast_json = ast_dict
+        else:
+            state = ConversationState(
+                conversation_id=conversation_id,
+                ast_json=ast_dict,
+            )
+            session.add(state)
+
+    def _create_default_tables(self) -> dict:
+        """Create default SQLAlchemy tables for the compiler."""
+        from sqlalchemy import Column, Date, ForeignKey, Integer, MetaData, Numeric, String
+        from sqlalchemy import Table as SATable
+        from sqlalchemy.dialects.postgresql import UUID
+
+        metadata = MetaData()
+
+        orders = SATable(
+            "orders",
+            metadata,
+            Column("order_id", UUID(as_uuid=True), primary_key=True),
+            Column("customer_id", UUID(as_uuid=True), ForeignKey("customers.customer_id")),
+            Column("product_id", UUID(as_uuid=True), ForeignKey("products.product_id")),
+            Column("order_date", Date),
+            Column("quantity", Integer),
+            Column("unit_price", Numeric(10, 2)),
+            Column("region", String),
+        )
+
+        products = SATable(
+            "products",
+            metadata,
+            Column("product_id", UUID(as_uuid=True), primary_key=True),
+            Column("product_line", String),
+            Column("category", String),
+        )
+
+        customers = SATable(
+            "customers",
+            metadata,
+            Column("customer_id", UUID(as_uuid=True), primary_key=True),
+            Column("name", String),
+            Column("segment", String),
+            Column("country", String),
+        )
+
+        return {
+            "orders": orders,
+            "products": products,
+            "customers": customers,
+        }
 
 
-# -----------------------------
-# Legacy function (for backwards compatibility)
-# -----------------------------
+# Global service instance
+_nlq_service: NLQService | None = None
 
 
-def queue_query(query: str) -> str:
-    """Queue an NLQ query for processing (placeholder)."""
-    return "pending"
+def get_nlq_service() -> NLQService:
+    """Get the NLQ service instance."""
+    global _nlq_service
+    if _nlq_service is None:
+        _nlq_service = NLQService()
+    return _nlq_service

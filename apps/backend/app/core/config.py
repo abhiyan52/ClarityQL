@@ -1,9 +1,15 @@
 """Application configuration settings."""
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Find project root (where .env file lives)
+_BACKEND_DIR = Path(__file__).resolve().parent.parent.parent  # app/core -> app -> backend
+_PROJECT_ROOT = _BACKEND_DIR.parent.parent  # backend -> apps -> project root
+_ENV_FILE = _PROJECT_ROOT / ".env"
 
 
 class Settings(BaseSettings):
@@ -11,12 +17,25 @@ class Settings(BaseSettings):
 
     app_name: str = "ClarityQL API"
     environment: str = "development"
+
+    # Database
     database_url: str = Field(
+        default="postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/clarityql"
+    )
+    database_url_sync: str = Field(
         default="postgresql+psycopg://postgres:postgres@127.0.0.1:5432/clarityql"
     )
 
+    # JWT Settings
+    jwt_secret_key: str = Field(
+        default="your-super-secret-key-change-in-production",
+        description="Secret key for JWT encoding/decoding",
+    )
+    jwt_algorithm: str = Field(default="HS256")
+    jwt_expire_minutes: int = Field(default=60 * 24, description="Token expiry in minutes")
+
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE) if _ENV_FILE.exists() else ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -56,7 +75,7 @@ class LLMSettings(BaseSettings):
     )
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=str(_ENV_FILE) if _ENV_FILE.exists() else ".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )

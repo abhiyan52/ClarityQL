@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: clarityql
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  backend:
+    image: python:3.11-slim
+    working_dir: /app
+    command: ["bash", "-c", "echo 'Backend placeholder container' && sleep infinity"]
+    ports:
+      - "8000:8000"
+    environment:
+      CLARITYQL_ENV: development
+
+volumes:
+  postgres_data:

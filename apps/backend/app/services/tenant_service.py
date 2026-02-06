@@ -34,22 +34,23 @@ async def get_or_create_default_tenant(session: AsyncSession) -> Tenant:
     tenant = result.scalar_one_or_none()
 
     if tenant is None:
-        # Create default tenant if it doesn't exist
-        tenant = Tenant(
-            id=DEFAULT_TENANT_ID,
-            name=DEFAULT_TENANT_NAME,
-            slug=DEFAULT_TENANT_SLUG,
-            is_active=True,
-        )
-        session.add(tenant)
-        
+        # Use a nested transaction (savepoint) to isolate the tenant creation
+        # This prevents rolling back the caller's transaction if creation fails
         try:
-            await session.flush()
+            async with session.begin_nested():
+                # Create default tenant if it doesn't exist
+                tenant = Tenant(
+                    id=DEFAULT_TENANT_ID,
+                    name=DEFAULT_TENANT_NAME,
+                    slug=DEFAULT_TENANT_SLUG,
+                    is_active=True,
+                )
+                session.add(tenant)
+                await session.flush()
         except IntegrityError:
             # Another concurrent request created the tenant first
-            # Remove the failed tenant object from session without rolling back
-            # This keeps the current transaction open for the caller
-            session.expunge(tenant)
+            # The nested transaction has been automatically rolled back
+            # Now fetch the existing tenant created by the concurrent request
             result = await session.execute(
                 select(Tenant).where(Tenant.id == DEFAULT_TENANT_ID)
             )

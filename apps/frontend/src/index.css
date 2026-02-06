@@ -107,3 +107,23 @@
 .typing-dot:nth-child(3) {
   animation-delay: 0.4s;
 }
+
+/* Document Viewer Styles */
+.document-viewer {
+  width: 100%;
+  height: 100%;
+}
+
+.document-viewer #pdf-controls {
+  display: none !important;
+}
+
+.document-viewer #header-bar {
+  display: none !important;
+}
+
+/* Improve document viewer scrolling */
+.document-viewer > div {
+  height: 100% !important;
+  overflow: auto !important;
+}

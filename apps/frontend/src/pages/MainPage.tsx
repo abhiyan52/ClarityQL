@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { PanelLeft, Moon, Sun } from "lucide-react";
+import { PanelLeft, Moon, Sun, FileText } from "lucide-react";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Sidebar } from "@/components/chat/Sidebar";
@@ -9,6 +10,7 @@ import { cn } from "@/lib/utils";
 export function MainPage() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [darkMode, setDarkMode] = useState(false);
+  const navigate = useNavigate();
 
   const toggleDarkMode = () => {
     setDarkMode(!darkMode);
@@ -41,6 +43,15 @@ export function MainPage() {
               </span>
             </div>
             <div className="flex items-center gap-2">
+              <Button 
+                variant="ghost" 
+                size="sm" 
+                onClick={() => navigate("/documents")}
+                className="gap-2"
+              >
+                <FileText className="h-4 w-4" />
+                Documents
+              </Button>
               <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
                 {darkMode ? (
                   <Sun className="h-4 w-4" />

@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth.routes import router as auth_router
 from app.api.nlq.routes import router as nlq_router
 from app.api.schema.routes import router as schema_router
+from app.api.rag.routes import router as rag_router
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -48,3 +49,4 @@ async def health_check() -> dict:
 app.include_router(auth_router, prefix="/auth", tags=["Authentication"])
 app.include_router(nlq_router, prefix="/api/nlq", tags=["NLQ"])
 app.include_router(schema_router, prefix="/api/schema", tags=["Schema"])
+app.include_router(rag_router, prefix="/api/rag", tags=["RAG Ingestion"])

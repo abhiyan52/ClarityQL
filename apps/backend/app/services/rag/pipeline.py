@@ -187,7 +187,8 @@ class IngestionPipeline:
             await session.commit()
 
             logger.info(
-                f"Document persisted: {document_record.id} with {len(chunks)} chunks"
+                f"Document persisted: {document_record.id} with {len(chunks)} chunks "
+                f"(status: CHUNKED, embeddings will be generated separately)"
             )
 
             # ── Step 7: Calculate stats ───────────────────────────────────

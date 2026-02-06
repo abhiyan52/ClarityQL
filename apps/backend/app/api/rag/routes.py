@@ -4,12 +4,19 @@ import logging
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status, UploadFile, File, BackgroundTasks
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, BackgroundTasks, Body
 from fastapi.responses import JSONResponse
 
 from app.core.dependencies import AsyncSessionDep, CurrentUser
 from app.models.task import Task, TaskStatus, TaskType
-from app.tasks.rag_tasks import ingest_document_task
+from app.tasks.rag_tasks import (
+    ingest_document_task,
+    generate_embeddings_task,
+    generate_embeddings_batch_task,
+    generate_embeddings_for_pending_documents_task,
+)
+from app.services.rag.query_service import RAGQueryService
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -17,6 +24,302 @@ logger = logging.getLogger(__name__)
 # Directory for uploaded files (configure via settings in production)
 UPLOAD_DIR = Path("/tmp/clarityql_uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ──────────────────────────────────────────────
+# Request/Response Schemas
+# ──────────────────────────────────────────────
+
+
+class RAGQueryRequest(BaseModel):
+    """Request schema for RAG query."""
+
+    query: str = Field(..., min_length=1, max_length=5000, description="User query")
+    document_ids: list[str] | None = Field(
+        None, description="Optional list of document IDs to search (None = all)"
+    )
+    conversation_id: str | None = Field(
+        None, description="Optional conversation ID for context"
+    )
+    top_k: int = Field(5, ge=1, le=50, description="Number of results to return")
+    min_similarity: float = Field(
+        0.0, ge=0.0, le=1.0, description="Minimum similarity threshold"
+    )
+
+
+class ChunkResult(BaseModel):
+    """A single chunk result from RAG query."""
+
+    chunk_id: str
+    document_id: str
+    document_title: str
+    content: str
+    page_number: int | None
+    section: str | None
+    chunk_index: int
+    similarity_score: float
+    token_count: int | None
+
+
+class RAGQueryResponse(BaseModel):
+    """Response schema for RAG query."""
+
+    conversation_id: str
+    query: str
+    chunks: list[ChunkResult]
+    documents: list[dict]
+    total_chunks_found: int
+
+
+# ──────────────────────────────────────────────
+# RAG Query Endpoint
+# ──────────────────────────────────────────────
+
+
+@router.post("/query", response_model=RAGQueryResponse)
+async def query_documents(
+    request: RAGQueryRequest,
+    session: AsyncSessionDep,
+    current_user: CurrentUser,
+) -> RAGQueryResponse:
+    """
+    Query documents using semantic search.
+
+    Embeds the user's query and finds the most similar chunks from the specified
+    documents (or all documents if none specified).
+
+    Args:
+        request: Query request with query text, optional document IDs, etc.
+        session: Database session (injected)
+        current_user: Authenticated user (injected)
+
+    Returns:
+        RAGQueryResponse with matching chunks and metadata
+
+    Raises:
+        HTTPException 400: If document IDs are invalid
+        HTTPException 404: If conversation not found
+        HTTPException 403: If user doesn't own conversation
+        HTTPException 500: If query processing fails
+
+    Example:
+        ```bash
+        curl -X POST http://localhost:8000/api/rag/query \\
+          -H "Authorization: Bearer <token>" \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "query": "What are the key findings?",
+            "document_ids": ["uuid1", "uuid2"],
+            "top_k": 5
+          }'
+        ```
+    """
+    try:
+        # Parse document IDs if provided
+        document_ids = None
+        if request.document_ids:
+            try:
+                document_ids = [UUID(doc_id) for doc_id in request.document_ids]
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid document ID format: {str(e)}",
+                )
+
+        # Parse conversation ID if provided
+        conversation_id = None
+        if request.conversation_id:
+            try:
+                conversation_id = UUID(request.conversation_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid conversation ID format",
+                )
+
+        # Execute query
+        rag_service = RAGQueryService(session)
+        result = await rag_service.query(
+            query=request.query,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+            document_ids=document_ids,
+            conversation_id=conversation_id,
+            top_k=request.top_k,
+            min_similarity=request.min_similarity,
+        )
+
+        return RAGQueryResponse(**result)
+
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e),
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.error(f"RAG query failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Query processing failed: {str(e)}",
+        )
+
+
+# ──────────────────────────────────────────────
+# Document Ingestion Endpoints
+# ──────────────────────────────────────────────
+
+
+# ──────────────────────────────────────────────
+# Request/Response Schemas
+# ──────────────────────────────────────────────
+
+
+class RAGQueryRequest(BaseModel):
+    """Request schema for RAG query."""
+
+    query: str = Field(..., min_length=1, max_length=5000, description="User query")
+    document_ids: list[str] | None = Field(
+        None, description="Optional list of document IDs to search (None = all)"
+    )
+    conversation_id: str | None = Field(
+        None, description="Optional conversation ID for context"
+    )
+    top_k: int = Field(5, ge=1, le=50, description="Number of results to return")
+    min_similarity: float = Field(
+        0.0, ge=0.0, le=1.0, description="Minimum similarity threshold"
+    )
+
+
+class ChunkResult(BaseModel):
+    """A single chunk result from RAG query."""
+
+    chunk_id: str
+    document_id: str
+    document_title: str
+    content: str
+    page_number: int | None
+    section: str | None
+    chunk_index: int
+    similarity_score: float
+    token_count: int | None
+
+
+class RAGQueryResponse(BaseModel):
+    """Response schema for RAG query."""
+
+    conversation_id: str
+    query: str
+    chunks: list[ChunkResult]
+    documents: list[dict]
+    total_chunks_found: int
+
+
+# ──────────────────────────────────────────────
+# RAG Query Endpoint
+# ──────────────────────────────────────────────
+
+
+@router.post("/query", response_model=RAGQueryResponse)
+async def query_documents(
+    request: RAGQueryRequest,
+    session: AsyncSessionDep,
+    current_user: CurrentUser,
+) -> RAGQueryResponse:
+    """
+    Query documents using semantic search.
+
+    Embeds the user's query and finds the most similar chunks from the specified
+    documents (or all documents if none specified).
+
+    Args:
+        request: Query request with query text, optional document IDs, etc.
+        session: Database session (injected)
+        current_user: Authenticated user (injected)
+
+    Returns:
+        RAGQueryResponse with matching chunks and metadata
+
+    Raises:
+        HTTPException 400: If document IDs are invalid
+        HTTPException 404: If conversation not found
+        HTTPException 403: If user doesn't own conversation
+        HTTPException 500: If query processing fails
+
+    Example:
+        ```bash
+        curl -X POST http://localhost:8000/api/rag/query \\
+          -H "Authorization: Bearer <token>" \\
+          -H "Content-Type: application/json" \\
+          -d '{
+            "query": "What are the key findings?",
+            "document_ids": ["uuid1", "uuid2"],
+            "top_k": 5
+          }'
+        ```
+    """
+    try:
+        # Parse document IDs if provided
+        document_ids = None
+        if request.document_ids:
+            try:
+                document_ids = [UUID(doc_id) for doc_id in request.document_ids]
+            except ValueError as e:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid document ID format: {str(e)}",
+                )
+
+        # Parse conversation ID if provided
+        conversation_id = None
+        if request.conversation_id:
+            try:
+                conversation_id = UUID(request.conversation_id)
+            except ValueError:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid conversation ID format",
+                )
+
+        # Execute query
+        rag_service = RAGQueryService(session)
+        result = await rag_service.query(
+            query=request.query,
+            tenant_id=current_user.tenant_id,
+            user_id=current_user.id,
+            document_ids=document_ids,
+            conversation_id=conversation_id,
+            top_k=request.top_k,
+            min_similarity=request.min_similarity,
+        )
+
+        return RAGQueryResponse(**result)
+
+    except PermissionError as e:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=str(e),
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(e),
+        )
+    except Exception as e:
+        logger.error(f"RAG query failed: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Query processing failed: {str(e)}",
+        )
+
+
+# ──────────────────────────────────────────────
+# Document Ingestion Endpoints
+# ──────────────────────────────────────────────
 
 
 @router.post("/ingest")
@@ -143,7 +446,7 @@ async def ingest_document_async(
         # Re-attach to session after commit and update celery_task_id
         task.celery_task_id = celery_task.id
         session.add(task)  # Re-add to session
-        await session.flush()  # Flush the update
+        await session.commit()  # Commit to persist celery_task_id
 
         logger.info(
             f"Ingestion task queued: {task.id} (Celery: {celery_task.id})"
@@ -376,9 +679,396 @@ async def list_documents(
                     "chunk_count": doc.chunk_count,
                     "source_type": doc.source_type.value,
                     "visibility": doc.visibility.value,
+                    "processing_status": doc.processing_status.value,
+                    "processing_error": doc.processing_error,
                     "created_at": doc.created_at.isoformat(),
+                    "updated_at": doc.updated_at.isoformat(),
                 }
                 for doc in documents
             ],
         }
     )
+
+
+@router.get("/documents/{document_id}")
+async def get_document(
+    document_id: str,
+    session: AsyncSessionDep,
+    current_user: CurrentUser,
+) -> JSONResponse:
+    """Get a specific document with full details including processing status."""
+    from sqlalchemy import select
+    from app.models.document import Document
+
+    # Parse UUID
+    try:
+        doc_uuid = UUID(document_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid document ID format",
+        )
+
+    # Fetch document (verify access)
+    result = await session.execute(
+        select(Document).where(
+            Document.id == doc_uuid,
+            Document.tenant_id == current_user.tenant_id,
+        )
+    )
+    document = result.scalar_one_or_none()
+
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found or not accessible",
+        )
+
+    return JSONResponse(
+        content={
+            "id": str(document.id),
+            "title": document.title,
+            "description": document.description,
+            "language": document.language,
+            "chunk_count": document.chunk_count,
+            "source_type": document.source_type.value,
+            "visibility": document.visibility.value,
+            "processing_status": document.processing_status.value,
+            "processing_error": document.processing_error,
+            "file_size_bytes": document.file_size_bytes,
+            "mime_type": document.mime_type,
+            "created_at": document.created_at.isoformat(),
+            "updated_at": document.updated_at.isoformat(),
+        }
+    )
+
+
+@router.get("/documents/{document_id}/download")
+async def download_document(
+    document_id: str,
+    session: AsyncSessionDep,
+    current_user: CurrentUser,
+):
+    """Download the original document file."""
+    from sqlalchemy import select
+    from app.models.document import Document
+    from fastapi.responses import FileResponse
+    import os
+
+    # Parse UUID
+    try:
+        doc_uuid = UUID(document_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid document ID format",
+        )
+
+    # Fetch document (verify access)
+    result = await session.execute(
+        select(Document).where(
+            Document.id == doc_uuid,
+            Document.tenant_id == current_user.tenant_id,
+        )
+    )
+    document = result.scalar_one_or_none()
+
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found or not accessible",
+        )
+
+    # Check if file exists
+    if not document.storage_path or not os.path.exists(document.storage_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document file not found on server",
+        )
+
+    # Return file
+    return FileResponse(
+        path=document.storage_path,
+        filename=document.title,
+        media_type=document.mime_type or "application/octet-stream",
+    )
+
+
+@router.post("/documents/{document_id}/generate-embeddings")
+async def generate_embeddings_for_document(
+    document_id: str,
+    session: AsyncSessionDep,
+    current_user: CurrentUser,
+    force: bool = False,
+) -> JSONResponse:
+    """
+    Trigger embedding generation for a specific document.
+
+    This endpoint allows manual triggering of embedding generation for:
+    - Documents that failed embedding generation
+    - Documents in CHUNKED status (not yet embedded)
+    - Documents in READY status (with force=true to regenerate)
+
+    Args:
+        document_id: UUID of the document.
+        session: Database session (injected).
+        current_user: Authenticated user (injected).
+        force: If true, regenerate embeddings even if document is READY.
+
+    Returns:
+        JSON with task status.
+
+    Raises:
+        HTTPException 404: If document not found.
+        HTTPException 400: If document status is invalid for embedding.
+
+    Example:
+        ```bash
+        curl -X POST http://localhost:8000/api/rag/documents/550e8400-.../generate-embeddings \\
+          -H "Authorization: Bearer <token>"
+
+        # Force regeneration:
+        curl -X POST "http://localhost:8000/api/rag/documents/550e8400-.../generate-embeddings?force=true" \\
+          -H "Authorization: Bearer <token>"
+        ```
+    """
+    from sqlalchemy import select
+    from app.models.document import Document, DocumentProcessingStatus
+
+    # Parse UUID
+    try:
+        doc_uuid = UUID(document_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid document ID format",
+        )
+
+    # Fetch document (verify access)
+    result = await session.execute(
+        select(Document).where(
+            Document.id == doc_uuid,
+            Document.tenant_id == current_user.tenant_id,
+        )
+    )
+    document = result.scalar_one_or_none()
+
+    if not document:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Document not found or not accessible",
+        )
+
+    # Check if document has chunks
+    if document.chunk_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Document has no chunks to embed",
+        )
+
+    # Check document status
+    valid_statuses = [
+        DocumentProcessingStatus.CHUNKED,
+        DocumentProcessingStatus.FAILED,
+    ]
+
+    if force:
+        valid_statuses.append(DocumentProcessingStatus.READY)
+
+    if document.processing_status not in valid_statuses:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot generate embeddings for document with status {document.processing_status.value}. "
+                f"Use force=true to regenerate embeddings for READY documents."
+            ),
+        )
+
+    # If forcing regeneration, clear existing embeddings
+    if force and document.processing_status == DocumentProcessingStatus.READY:
+        from app.models.chunk import Chunk
+        from sqlalchemy import update
+
+        logger.info(f"Force regeneration: clearing embeddings for document {document_id}")
+
+        await session.execute(
+            update(Chunk)
+            .where(Chunk.document_id == doc_uuid)
+            .values(embedding=None)
+        )
+
+        # Set status back to CHUNKED
+        document.processing_status = DocumentProcessingStatus.CHUNKED
+        await session.commit()
+
+    # Queue embedding task
+    try:
+        celery_task = generate_embeddings_task.delay(document_id=str(doc_uuid))
+
+        logger.info(
+            f"Embedding generation queued for document {document_id}: {celery_task.id}"
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "document_id": str(doc_uuid),
+                "celery_task_id": celery_task.id,
+                "status": "queued",
+                "message": "Embedding generation queued successfully",
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to queue embedding task: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to queue embedding task: {str(e)}",
+        )
+
+
+@router.post("/embeddings/generate-batch")
+async def generate_embeddings_batch(
+    document_ids: list[str] = Body(...),
+    session: AsyncSessionDep = None,
+    current_user: CurrentUser = None,
+) -> JSONResponse:
+    """
+    Generate embeddings for multiple documents in parallel.
+
+    This endpoint allows batch processing of embeddings for multiple documents.
+
+    Args:
+        document_ids: List of document UUIDs.
+        session: Database session (injected).
+        current_user: Authenticated user (injected).
+
+    Returns:
+        JSON with batch task status.
+
+    Raises:
+        HTTPException 400: If document IDs are invalid.
+
+    Example:
+        ```bash
+        curl -X POST http://localhost:8000/api/rag/embeddings/generate-batch \\
+          -H "Authorization: Bearer <token>" \\
+          -H "Content-Type: application/json" \\
+          -d '{"document_ids": ["550e8400-...", "660e8400-..."]}'
+        ```
+    """
+    from sqlalchemy import select
+    from app.models.document import Document
+
+    if not document_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No document IDs provided",
+        )
+
+    # Validate document IDs and access
+    valid_doc_ids = []
+
+    for doc_id in document_ids:
+        try:
+            doc_uuid = UUID(doc_id)
+        except ValueError:
+            logger.warning(f"Invalid document ID format: {doc_id}")
+            continue
+
+        # Check document exists and user has access
+        result = await session.execute(
+            select(Document).where(
+                Document.id == doc_uuid,
+                Document.tenant_id == current_user.tenant_id,
+            )
+        )
+        document = result.scalar_one_or_none()
+
+        if document and document.chunk_count > 0:
+            valid_doc_ids.append(doc_id)
+        else:
+            logger.warning(f"Document {doc_id} not found or has no chunks")
+
+    if not valid_doc_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No valid documents found for embedding generation",
+        )
+
+    # Queue batch embedding task
+    try:
+        celery_task = generate_embeddings_batch_task.delay(
+            document_ids=valid_doc_ids,
+            batch_size=32,
+        )
+
+        logger.info(
+            f"Batch embedding generation queued for {len(valid_doc_ids)} documents: {celery_task.id}"
+        )
+
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "documents_queued": len(valid_doc_ids),
+                "celery_task_id": celery_task.id,
+                "status": "queued",
+                "message": f"Batch embedding generation queued for {len(valid_doc_ids)} documents",
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to queue batch embedding task: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to queue batch embedding task: {str(e)}",
+        )
+
+
+@router.post("/embeddings/generate-pending")
+async def generate_embeddings_for_pending(
+    session: AsyncSessionDep,
+    current_user: CurrentUser,
+) -> JSONResponse:
+    """
+    Generate embeddings for all pending documents (CHUNKED status).
+
+    This is a maintenance endpoint that processes all documents waiting for embeddings.
+    Useful for:
+    - Recovering from failed embedding tasks
+    - Processing backlog of documents
+    - Scheduled maintenance jobs
+
+    Args:
+        session: Database session (injected).
+        current_user: Authenticated user (injected).
+
+    Returns:
+        JSON with task status.
+
+    Example:
+        ```bash
+        curl -X POST http://localhost:8000/api/rag/embeddings/generate-pending \\
+          -H "Authorization: Bearer <token>"
+        ```
+    """
+    try:
+        celery_task = generate_embeddings_for_pending_documents_task.delay()
+
+        logger.info(f"Pending embeddings task queued: {celery_task.id}")
+
+        return JSONResponse(
+            status_code=status.HTTP_202_ACCEPTED,
+            content={
+                "celery_task_id": celery_task.id,
+                "status": "queued",
+                "message": "Pending documents embedding generation queued successfully",
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to queue pending embeddings task: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to queue task: {str(e)}",
+        )

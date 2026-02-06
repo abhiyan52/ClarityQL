@@ -49,6 +49,8 @@ celery_app.conf.update(
 celery_app.conf.task_routes = {
     "app.tasks.rag_tasks.ingest_document_task": {"queue": "rag_ingestion"},
     "app.tasks.rag_tasks.generate_embeddings_task": {"queue": "rag_embeddings"},
+    "app.tasks.rag_tasks.generate_embeddings_batch_task": {"queue": "rag_embeddings"},
+    "app.tasks.rag_tasks.generate_embeddings_for_pending_documents_task": {"queue": "rag_embeddings"},
 }
 
 

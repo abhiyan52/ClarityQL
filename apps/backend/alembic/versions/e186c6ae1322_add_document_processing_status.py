@@ -20,13 +20,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # Create enum type for document processing status
+    # Use IF NOT EXISTS for idempotency
     op.execute("""
-        CREATE TYPE document_processing_status AS ENUM (
+        CREATE TYPE IF NOT EXISTS document_processing_status AS ENUM (
             'uploaded', 'parsing', 'parsed', 'chunking', 'chunked', 'embedding', 'ready', 'failed'
         )
     """)
     
     # Add processing_status column
+    # create_type=False because we created the type above
     op.add_column(
         'documents',
         sa.Column(
@@ -34,7 +36,7 @@ def upgrade() -> None:
             sa.Enum(
                 'uploaded', 'parsing', 'parsed', 'chunking', 'chunked', 'embedding', 'ready', 'failed',
                 name='document_processing_status',
-                create_type=False
+                create_type=False  # Type already created above
             ),
             nullable=False,
             server_default='uploaded'
@@ -63,5 +65,5 @@ def downgrade() -> None:
     op.drop_column('documents', 'processing_error')
     op.drop_column('documents', 'processing_status')
     
-    # Drop enum type
-    op.execute('DROP TYPE document_processing_status')
+    # Drop enum type (use IF EXISTS for safety)
+    op.execute('DROP TYPE IF EXISTS document_processing_status')

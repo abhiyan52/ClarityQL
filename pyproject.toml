@@ -29,6 +29,18 @@ dependencies = [
   # Auth
   "python-jose[cryptography]",
   "bcrypt>=4.0.0,<5.0.0",
+  # RAG / pgvector
+  "pgvector",
+  # Migrations
+  "alembic",
+  # Document processing (RAG ingestion)
+  "docling",
+  "docling-core",
+  "langdetect",  # Language detection
+  "python-magic",  # File type detection
+  # Async task processing
+  "celery[sqlalchemy]>=5.3.0",
+  "redis>=5.0.0",  # Redis for Celery broker
 ]
 
 [tool.uv]

@@ -12,6 +12,7 @@ from app.schemas.auth import (
     RegisterRequest,
     UserResponse,
 )
+from app.services.tenant_service import get_default_tenant_id
 
 router = APIRouter()
 
@@ -83,10 +84,14 @@ async def register(
             detail="Email already registered",
         )
 
-    # Create new user
+    # Get default tenant ID (creates tenant if it doesn't exist)
+    tenant_id = await get_default_tenant_id(session)
+
+    # Create new user assigned to default tenant
     user = User(
         email=payload.email,
         hashed_password=hash_password(payload.password),
+        tenant_id=tenant_id,
     )
     session.add(user)
     await session.flush()

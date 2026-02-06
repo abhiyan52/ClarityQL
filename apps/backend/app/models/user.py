@@ -3,7 +3,7 @@
 from datetime import datetime
 from uuid import uuid4
 
-from sqlalchemy import DateTime, String, func
+from sqlalchemy import DateTime, ForeignKey, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -19,6 +19,12 @@ class User(Base):
         UUID(as_uuid=True),
         primary_key=True,
         default=uuid4,
+    )
+    tenant_id: Mapped[UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tenants.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     email: Mapped[str] = mapped_column(
         String(255),
@@ -37,6 +43,10 @@ class User(Base):
     )
 
     # Relationships
+    tenant: Mapped["Tenant"] = relationship(
+        "Tenant",
+        back_populates="users",
+    )
     conversations: Mapped[list["Conversation"]] = relationship(
         "Conversation",
         back_populates="user",

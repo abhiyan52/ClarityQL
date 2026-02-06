@@ -34,6 +34,16 @@ class Settings(BaseSettings):
     jwt_algorithm: str = Field(default="HS256")
     jwt_expire_minutes: int = Field(default=60 * 24, description="Token expiry in minutes")
 
+    # Celery Settings
+    celery_broker_url: str = Field(
+        default="redis://127.0.0.1:6379/0",
+        description="Celery broker URL (Redis)",
+    )
+    celery_result_backend: str = Field(
+        default="db+postgresql+psycopg://postgres:postgres@127.0.0.1:5432/clarityql",
+        description="Celery result backend (Database)",
+    )
+
     model_config = SettingsConfigDict(
         env_file=str(_ENV_FILE) if _ENV_FILE.exists() else ".env",
         env_file_encoding="utf-8",

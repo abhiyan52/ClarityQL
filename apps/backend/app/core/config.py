@@ -103,6 +103,33 @@ class LLMSettings(BaseSettings):
                 return None
 
 
+class EmbeddingSettings(BaseSettings):
+    """Embedding model configuration settings."""
+
+    embedding_model: str = Field(
+        default="intfloat/multilingual-e5-large-instruct",
+        description="Sentence Transformer model name for embeddings",
+    )
+    embedding_dimension: int = Field(
+        default=1024,
+        description="Embedding vector dimension (must match model output)",
+    )
+    embedding_normalize: bool = Field(
+        default=True,
+        description="Whether to normalize embeddings to unit length",
+    )
+    embedding_cache_dir: str | None = Field(
+        default=None,
+        description="Optional directory to cache downloaded models",
+    )
+
+    model_config = SettingsConfigDict(
+        env_file=str(_ENV_FILE) if _ENV_FILE.exists() else ".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 @lru_cache
 def get_settings() -> Settings:
     """Get cached application settings."""
@@ -115,6 +142,13 @@ def get_llm_settings() -> LLMSettings:
     return LLMSettings()
 
 
+@lru_cache
+def get_embedding_settings() -> EmbeddingSettings:
+    """Get cached embedding settings."""
+    return EmbeddingSettings()
+
+
 # Convenience instances
 settings = get_settings()
 llm_settings = get_llm_settings()
+embedding_settings = get_embedding_settings()

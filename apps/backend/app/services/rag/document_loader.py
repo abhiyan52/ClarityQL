@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from docling.document_converter import DocumentConverter
-from docling_core.types.doc import DoclingDocument, DocItem
+from docling_core.types.doc import DoclingDocument, DocItem, TextItem, TableItem
 
 from app.schemas.rag import SupportedFileType
 
@@ -176,18 +176,29 @@ class DoclingDocumentLoader:
         current_heading_level = None
 
         try:
-            # Iterate through doc items (Docling's structured output)
-            for item in doc.iterate_items():
-                if not isinstance(item, DocItem):
+            # iterate_items() yields (item, level) tuples in reading order
+            for item, level in doc.iterate_items():
+                # Extract text from TextItem instances (paragraphs, headings, etc.)
+                if isinstance(item, TextItem):
+                    text = item.text.strip() if item.text else ""
+                elif isinstance(item, TableItem):
+                    # Export table as markdown for downstream chunking
+                    try:
+                        text = item.export_to_markdown(doc=doc).strip()
+                    except Exception:
+                        text = str(item).strip()
+                else:
                     continue
 
-                text = self._extract_item_text(item)
-                if not text or not text.strip():
+                if not text:
                     continue
+
+                # Get the label as a string value
+                label = item.label.value if hasattr(item.label, "value") else str(item.label)
 
                 # Build metadata
                 metadata = {
-                    "element_type": item.label if hasattr(item, "label") else "text",
+                    "element_type": label,
                     "page_number": self._get_page_number(item),
                     "heading_level": None,
                     "section_title": current_section,
@@ -195,10 +206,10 @@ class DoclingDocumentLoader:
 
                 # Track section headings
                 if self._is_heading(item):
-                    level = self._get_heading_level(item)
-                    metadata["heading_level"] = level
+                    heading_level = self._get_heading_level(item)
+                    metadata["heading_level"] = heading_level
                     current_section = text
-                    current_heading_level = level
+                    current_heading_level = heading_level
                 elif current_section:
                     metadata["section_title"] = current_section
 
@@ -208,17 +219,8 @@ class DoclingDocumentLoader:
             return elements
 
         except Exception as e:
-            logger.error(f"Failed to extract text elements: {e}")
+            logger.error(f"Failed to extract text elements: {e}", exc_info=True)
             raise DocumentLoadError(f"Failed to extract text: {e}")
-
-    def _extract_item_text(self, item: DocItem) -> str:
-        """Extract text from a DocItem."""
-        # Docling items have text attribute
-        if hasattr(item, "text"):
-            return str(item.text).strip()
-
-        # Fallback to string representation
-        return str(item).strip()
 
     def _get_page_number(self, item: DocItem) -> Optional[int]:
         """Get page number from DocItem (1-indexed)."""
@@ -234,20 +236,23 @@ class DoclingDocumentLoader:
         if not hasattr(item, "label"):
             return False
 
-        label = str(item.label).lower()
-        return "heading" in label or "title" in label
+        # label is a DocItemLabel enum; convert to string for matching
+        label = item.label.value if hasattr(item.label, "value") else str(item.label)
+        label_lower = label.lower()
+        return "heading" in label_lower or "title" in label_lower
 
     def _get_heading_level(self, item: DocItem) -> Optional[int]:
-        """Extract heading level from item label (e.g., 'heading-1' -> 1)."""
+        """Extract heading level from item label (e.g., 'section_header' -> 1)."""
         if not self._is_heading(item):
             return None
 
-        label = str(item.label).lower()
+        label = item.label.value if hasattr(item.label, "value") else str(item.label)
+        label_lower = label.lower()
 
         # Try to parse level from label like "heading-1", "heading_1", "h1"
         for delimiter in ["-", "_", " "]:
-            if delimiter in label:
-                parts = label.split(delimiter)
+            if delimiter in label_lower:
+                parts = label_lower.split(delimiter)
                 for part in parts:
                     if part.isdigit():
                         return int(part)
@@ -267,11 +272,12 @@ class DoclingDocumentLoader:
 
         # Try to get first heading
         try:
-            for item in doc.iterate_items():
-                if isinstance(item, DocItem) and hasattr(item, "label"):
-                    label = str(item.label).lower()
-                    if "title" in label or "heading" in label:
-                        text = str(item.text).strip()
+            for item, level in doc.iterate_items():
+                if isinstance(item, TextItem) and hasattr(item, "label"):
+                    label = item.label.value if hasattr(item.label, "value") else str(item.label)
+                    label_lower = label.lower()
+                    if "title" in label_lower or "heading" in label_lower:
+                        text = item.text.strip() if item.text else ""
                         if text:
                             return text
         except Exception:
@@ -288,7 +294,7 @@ class DoclingDocumentLoader:
         # Try to count from items
         try:
             max_page = 0
-            for item in doc.iterate_items():
+            for item, level in doc.iterate_items():
                 if hasattr(item, "prov") and item.prov:
                     for prov in item.prov:
                         if hasattr(prov, "page_no"):

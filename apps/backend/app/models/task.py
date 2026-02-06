@@ -50,10 +50,10 @@ class Task(Base):
     )
 
     # ── Task identification ──────────────────
-    celery_task_id: Mapped[str] = mapped_column(
+    celery_task_id: Mapped[str | None] = mapped_column(
         String(255),
         unique=True,
-        nullable=False,
+        nullable=True,
         index=True,
         comment="Celery task ID for tracking",
     )

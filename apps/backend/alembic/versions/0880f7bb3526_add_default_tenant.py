@@ -8,10 +8,19 @@ Creates a default tenant for single-tenant usage.
 All existing and new users without a tenant will be assigned to this tenant.
 """
 
+import sys
+from pathlib import Path
 from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+
+# Add backend directory to path to import constants
+_ALEMBIC_DIR = Path(__file__).resolve().parent.parent
+_BACKEND_DIR = _ALEMBIC_DIR.parent
+sys.path.insert(0, str(_BACKEND_DIR))
+
+from app.core.constants import DEFAULT_TENANT_ID
 
 # revision identifiers, used by Alembic.
 revision: str = "0880f7bb3526"
@@ -19,43 +28,33 @@ down_revision: Union[str, Sequence[str], None] = "65fb84b2c6a2"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# Default tenant UUID (fixed for consistency across environments)
-DEFAULT_TENANT_ID = "00000000-0000-0000-0000-000000000001"
-
 
 def upgrade() -> None:
     """Create default tenant and assign existing users to it."""
 
     # ── Insert default tenant ─────────────────────────────────────────
     op.execute(
-        sa.text("""
+        sa.text(f"""
         INSERT INTO tenants (id, name, slug, is_active, created_at, updated_at)
         VALUES (
-            :tenant_id::uuid,
-            :name,
-            :slug,
-            :is_active,
+            '{DEFAULT_TENANT_ID}'::uuid,
+            'Default Organization',
+            'default',
+            true,
             NOW(),
             NOW()
         )
         ON CONFLICT (slug) DO NOTHING
-        """),
-        {
-            "tenant_id": DEFAULT_TENANT_ID,
-            "name": "Default Organization",
-            "slug": "default",
-            "is_active": True,
-        },
+        """)
     )
 
     # ── Assign all existing users to default tenant ───────────────────
     op.execute(
-        sa.text("""
+        sa.text(f"""
         UPDATE users
-        SET tenant_id = :tenant_id::uuid
+        SET tenant_id = '{DEFAULT_TENANT_ID}'::uuid
         WHERE tenant_id IS NULL
-        """),
-        {"tenant_id": DEFAULT_TENANT_ID},
+        """)
     )
 
     # ── Make tenant_id NOT NULL (now that all users have a tenant) ────
@@ -80,9 +79,8 @@ def downgrade() -> None:
 
     # ── Remove default tenant ─────────────────────────────────────────
     op.execute(
-        sa.text("""
+        sa.text(f"""
         DELETE FROM tenants
-        WHERE id = :tenant_id::uuid
-        """),
-        {"tenant_id": DEFAULT_TENANT_ID},
+        WHERE id = '{DEFAULT_TENANT_ID}'::uuid
+        """)
     )

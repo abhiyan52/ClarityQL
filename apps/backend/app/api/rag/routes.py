@@ -96,7 +96,8 @@ async def ingest_document_async(
                 detail=f"Failed to save file: {str(e)}",
             )
 
-        # Create task record in database
+        # Create task record in database first (before queueing Celery task)
+        # This prevents race conditions where the worker starts before the DB commit
         task = Task(
             task_type=TaskType.DOCUMENT_INGESTION,
             tenant_id=current_user.tenant_id,
@@ -108,14 +109,14 @@ async def ingest_document_async(
                 "document_title": document_title,
                 "max_chunk_tokens": max_chunk_tokens,
             },
-            celery_task_id="",  # Will be updated after Celery task created
+            celery_task_id=None,  # Will be set after queueing
         )
 
         session.add(task)
-        await session.flush()
+        await session.flush()  # Get task.id without committing
         await session.refresh(task)
 
-        # Queue Celery task
+        # Queue Celery task (after task record exists in DB)
         celery_task = ingest_document_task.delay(
             file_path=str(file_path),
             document_title=document_title,
@@ -125,12 +126,12 @@ async def ingest_document_async(
             owner_user_id=str(current_user.id),
             max_chunk_tokens=max_chunk_tokens,
             chunk_overlap_tokens=chunk_overlap_tokens,
-            task_db_id=str(task.id),
         )
 
         # Update task with Celery task ID
+        # Note: Do NOT commit here - the session dependency handles commit
+        # after successful endpoint completion for proper transactional semantics
         task.celery_task_id = celery_task.id
-        await session.commit()
 
         logger.info(
             f"Ingestion task queued: {task.id} (Celery: {celery_task.id})"

@@ -25,11 +25,7 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="UTC",
     enable_utc=True,
-    # Result backend settings
-    result_backend_transport_options={
-        "visibility_timeout": 3600,  # 1 hour
-        "master_name": "mymaster",
-    },
+    # Result expiration
     result_expires=3600 * 24,  # Results expire after 24 hours
     # Task execution settings
     task_track_started=True,

@@ -25,6 +25,8 @@ async def get_or_create_default_tenant(session: AsyncSession) -> Tenant:
     Returns:
         The default Tenant object
     """
+    from sqlalchemy.exc import IntegrityError
+
     # Try to fetch existing default tenant
     result = await session.execute(
         select(Tenant).where(Tenant.id == DEFAULT_TENANT_ID)
@@ -40,7 +42,18 @@ async def get_or_create_default_tenant(session: AsyncSession) -> Tenant:
             is_active=True,
         )
         session.add(tenant)
-        await session.flush()
+        
+        try:
+            await session.flush()
+        except IntegrityError:
+            # Another concurrent request created the tenant first
+            # Remove the failed tenant object from session without rolling back
+            # This keeps the current transaction open for the caller
+            session.expunge(tenant)
+            result = await session.execute(
+                select(Tenant).where(Tenant.id == DEFAULT_TENANT_ID)
+            )
+            tenant = result.scalar_one()
 
     return tenant
 

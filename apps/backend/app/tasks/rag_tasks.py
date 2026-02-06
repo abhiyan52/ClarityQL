@@ -1,7 +1,7 @@
 """Celery tasks for RAG document ingestion and processing."""
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
@@ -37,7 +37,7 @@ class CallbackTask(CeleryTask):
             if task:
                 task.status = TaskStatus.FAILURE
                 task.error_message = str(exc)
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(timezone.utc)
                 session.commit()
 
     def on_success(self, retval, task_id, args, kwargs):
@@ -50,7 +50,7 @@ class CallbackTask(CeleryTask):
             if task:
                 task.status = TaskStatus.SUCCESS
                 task.result = retval
-                task.completed_at = datetime.utcnow()
+                task.completed_at = datetime.now(timezone.utc)
                 session.commit()
 
     def update_progress(self, task_id: str, current: int, total: int, message: str):
@@ -82,7 +82,6 @@ def ingest_document_task(
     owner_user_id: str,
     max_chunk_tokens: int,
     chunk_overlap_tokens: int,
-    task_db_id: str,
 ) -> dict:
     """
     Async task to ingest a document.
@@ -97,7 +96,6 @@ def ingest_document_task(
         owner_user_id: Owner user UUID (string).
         max_chunk_tokens: Max tokens per chunk.
         chunk_overlap_tokens: Overlap tokens.
-        task_db_id: Task database record ID.
 
     Returns:
         Dict with ingestion results.
@@ -114,7 +112,7 @@ def ingest_document_task(
             task = session.query(Task).filter(Task.celery_task_id == task_id).first()
             if task:
                 task.status = TaskStatus.STARTED
-                task.started_at = datetime.utcnow()
+                task.started_at = datetime.now(timezone.utc)
                 task.progress_message = "Loading document..."
                 session.commit()
 

@@ -12,12 +12,13 @@ from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.document import Document, DocumentSourceType, DocumentVisibility
+from app.models.document import Document, DocumentSourceType, DocumentVisibility, DocumentProcessingStatus
 from app.schemas.rag import (
     IngestionRequest,
     IngestionResponse,
     IngestionStats,
     ProcessedChunk,
+    DocumentProcessingStatus as SchemaDocumentProcessingStatus,
 )
 from app.services.rag.chunker import SemanticChunker
 from app.services.rag.document_loader import DoclingDocumentLoader, DocumentLoadError
@@ -65,138 +66,179 @@ class IngestionPipeline:
             DocumentLoadError: If loading or processing fails.
 
         Workflow:
-            1. Load and parse document (Docling)
-            2. Extract structured elements
-            3. Detect language
-            4. Chunk content semantically
-            5. Persist to database (Document + Chunks without embeddings)
-            6. Return stats
+            1. Create document record with UPLOADED status
+            2. Load and parse document (Docling) - update to PARSING/PARSED
+            3. Extract structured elements
+            4. Detect language
+            5. Chunk content semantically - update to CHUNKING/CHUNKED
+            6. Persist to database (Document + Chunks without embeddings)
+            7. Return stats
         """
         start_time = time.time()
+        document_record = None
 
-        logger.info(f"Starting ingestion pipeline for: {request.file_path}")
+        try:
+            logger.info(f"Starting ingestion pipeline for: {request.file_path}")
 
-        # ── Step 1: Load document ─────────────────────────────────────
-        doc = self.loader.load(request.file_path)
+            # ── Step 0: Create initial document record with UPLOADED status ───
+            document_record = await self._create_initial_document(
+                session=session,
+                request=request,
+            )
+            await session.commit()
+            
+            logger.info(
+                f"Document record created: {document_record.id} with status UPLOADED"
+            )
 
-        # Extract metadata
-        document_title = (
-            request.document_title or self.loader.get_document_title(doc)
-        )
-        file_name = Path(request.file_path).name
-        page_count = self.loader.get_page_count(doc)
+            # ── Step 1: Load document (PARSING) ────────────────────────────
+            await self._update_document_status(
+                session=session,
+                document_id=document_record.id,
+                status=DocumentProcessingStatus.PARSING,
+            )
+            
+            doc = self.loader.load(request.file_path)
 
-        logger.info(
-            f"Document loaded: {document_title} "
-            f"({page_count or 'N/A'} pages)"
-        )
+            # Extract metadata
+            document_title = (
+                request.document_title or self.loader.get_document_title(doc)
+            )
+            file_name = Path(request.file_path).name
+            page_count = self.loader.get_page_count(doc)
 
-        # ── Step 2: Extract text elements ─────────────────────────────
-        elements = self.loader.extract_text_elements(doc)
+            logger.info(
+                f"Document loaded: {document_title} "
+                f"({page_count or 'N/A'} pages)"
+            )
 
-        if not elements:
-            raise DocumentLoadError("No text content extracted from document")
+            # ── Step 2: Extract text elements (PARSED) ─────────────────────
+            elements = self.loader.extract_text_elements(doc)
 
-        logger.info(f"Extracted {len(elements)} text elements")
+            if not elements:
+                raise DocumentLoadError("No text content extracted from document")
 
-        # ── Step 3: Detect language ───────────────────────────────────
-        language = request.language
+            await self._update_document_status(
+                session=session,
+                document_id=document_record.id,
+                status=DocumentProcessingStatus.PARSED,
+            )
 
-        if not language:
-            # Sample first few elements for language detection
-            sample_texts = [text for text, _ in elements[:5]]
-            language = detect_language_from_multiple_samples(sample_texts)
+            logger.info(f"Extracted {len(elements)} text elements")
 
-        logger.info(f"Document language: {language}")
+            # ── Step 3: Detect language ───────────────────────────────────
+            language = request.language
 
-        # ── Step 4: Chunk content ─────────────────────────────────────
-        chunker = SemanticChunker(
-            max_tokens=request.max_chunk_tokens,
-            overlap_tokens=request.chunk_overlap_tokens,
-        )
+            if not language:
+                # Sample first few elements for language detection
+                sample_texts = [text for text, _ in elements[:5]]
+                language = detect_language_from_multiple_samples(sample_texts)
 
-        chunks: list[ProcessedChunk] = chunker.chunk_elements(
-            elements=elements,
-            document_title=document_title,
-            file_name=file_name,
-            language=language,
-        )
+            logger.info(f"Document language: {language}")
 
-        if not chunks:
-            raise DocumentLoadError("Failed to create chunks from document")
+            # ── Step 4: Chunk content (CHUNKING) ───────────────────────────
+            await self._update_document_status(
+                session=session,
+                document_id=document_record.id,
+                status=DocumentProcessingStatus.CHUNKING,
+            )
+            
+            chunker = SemanticChunker(
+                max_tokens=request.max_chunk_tokens,
+                overlap_tokens=request.chunk_overlap_tokens,
+            )
 
-        logger.info(f"Created {len(chunks)} chunks")
+            chunks: list[ProcessedChunk] = chunker.chunk_elements(
+                elements=elements,
+                document_title=document_title,
+                file_name=file_name,
+                language=language,
+            )
 
-        # ── Step 5: Calculate checksum ────────────────────────────────
-        checksum = await self._calculate_file_checksum(request.file_path)
+            if not chunks:
+                raise DocumentLoadError("Failed to create chunks from document")
 
-        # ── Step 6: Persist to database ───────────────────────────────
-        document_record = await self._persist_document(
-            session=session,
-            request=request,
-            document_title=document_title,
-            file_name=file_name,
-            language=language,
-            page_count=page_count,
-            chunk_count=len(chunks),
-            checksum=checksum,
-        )
+            logger.info(f"Created {len(chunks)} chunks")
 
-        # Persist chunks (without embeddings for now)
-        await self._persist_chunks(
-            session=session,
-            chunks=chunks,
-            document_id=document_record.id,
-            tenant_id=document_record.tenant_id,
-        )
+            # ── Step 5: Calculate checksum ────────────────────────────────
+            checksum = await self._calculate_file_checksum(request.file_path)
 
-        await session.commit()
+            # ── Step 6: Update document with full metadata (CHUNKED) ──────
+            await self._update_document_metadata(
+                session=session,
+                document_record=document_record,
+                document_title=document_title,
+                file_name=file_name,
+                language=language,
+                page_count=page_count,
+                chunk_count=len(chunks),
+                checksum=checksum,
+                status=DocumentProcessingStatus.CHUNKED,
+            )
 
-        logger.info(
-            f"Document persisted: {document_record.id} with {len(chunks)} chunks"
-        )
+            # Persist chunks (without embeddings for now)
+            await self._persist_chunks(
+                session=session,
+                chunks=chunks,
+                document_id=document_record.id,
+                tenant_id=document_record.tenant_id,
+            )
 
-        # ── Step 7: Calculate stats ───────────────────────────────────
-        total_tokens = sum(chunk.metadata.token_count for chunk in chunks)
-        avg_tokens = total_tokens / len(chunks) if chunks else 0
+            await session.commit()
 
-        stats = IngestionStats(
-            total_chunks=len(chunks),
-            total_tokens=total_tokens,
-            avg_tokens_per_chunk=round(avg_tokens, 1),
-            pages_processed=page_count,
-            language_detected=language,
-        )
+            logger.info(
+                f"Document persisted: {document_record.id} with {len(chunks)} chunks"
+            )
 
-        # ── Step 8: Return response ───────────────────────────────────
-        processing_time = (time.time() - start_time) * 1000  # ms
+            # ── Step 7: Calculate stats ───────────────────────────────────
+            total_tokens = sum(chunk.metadata.token_count for chunk in chunks)
+            avg_tokens = total_tokens / len(chunks) if chunks else 0
 
-        response = IngestionResponse(
-            document_id=document_record.id,
-            chunks_created=len(chunks),
-            stats=stats,
-            processing_time_ms=round(processing_time, 2),
-            created_at=document_record.created_at,
-        )
+            stats = IngestionStats(
+                total_chunks=len(chunks),
+                total_tokens=total_tokens,
+                avg_tokens_per_chunk=round(avg_tokens, 1),
+                pages_processed=page_count,
+                language_detected=language,
+            )
 
-        logger.info(
-            f"Ingestion complete: {len(chunks)} chunks in {processing_time:.0f}ms"
-        )
+            # ── Step 8: Return response ───────────────────────────────────
+            processing_time = (time.time() - start_time) * 1000  # ms
 
-        return response
+            response = IngestionResponse(
+                document_id=document_record.id,
+                chunks_created=len(chunks),
+                processing_status=SchemaDocumentProcessingStatus.CHUNKED,
+                stats=stats,
+                processing_time_ms=round(processing_time, 2),
+                created_at=document_record.created_at,
+            )
 
-    async def _persist_document(
+            logger.info(
+                f"Ingestion complete: {len(chunks)} chunks in {processing_time:.0f}ms"
+            )
+
+            return response
+
+        except Exception as e:
+            # Mark document as FAILED if it was created
+            if document_record:
+                await self._mark_document_failed(
+                    session=session,
+                    document_id=document_record.id,
+                    error_message=str(e),
+                )
+                await session.commit()
+            
+            logger.error(f"Ingestion failed: {e}", exc_info=True)
+            raise
+
+    async def _create_initial_document(
         self,
         session: AsyncSession,
         request: IngestionRequest,
-        document_title: str,
-        file_name: str,
-        language: str,
-        page_count: Optional[int],
-        chunk_count: int,
-        checksum: str,
     ) -> Document:
-        """Persist document record to database."""
+        """Create initial document record with UPLOADED status."""
         from app.models.document import Document as DocumentModel
 
         # Map source type
@@ -210,24 +252,24 @@ class IngestionPipeline:
             DocumentSourceType.UPLOADED,
         )
 
-        # Create document record
+        file_name = Path(request.file_path).name
+
+        # Create minimal document record with chunking metadata
         document = DocumentModel(
             tenant_id=request.tenant_id,
             owner_user_id=request.owner_user_id,
-            title=document_title,
+            title=request.document_title or file_name,
             description=request.description,
             source_type=source_type,
-            visibility=DocumentVisibility.TENANT,  # Default to tenant-wide
+            visibility=DocumentVisibility.TENANT,
             storage_path=request.file_path,
             mime_type=self._detect_mime_type(file_name),
-            checksum=checksum,
-            file_size_bytes=Path(request.file_path).stat().st_size,
             version=1,
-            language=language,
+            language="unknown",  # Will be updated after detection
             is_active=True,
-            chunk_count=chunk_count,
+            processing_status=DocumentProcessingStatus.UPLOADED,
+            chunk_count=0,
             extra_metadata={
-                "pages": page_count,
                 "chunking": {
                     "max_tokens": request.max_chunk_tokens,
                     "overlap_tokens": request.chunk_overlap_tokens,
@@ -240,6 +282,82 @@ class IngestionPipeline:
         await session.refresh(document)
 
         return document
+
+    async def _update_document_status(
+        self,
+        session: AsyncSession,
+        document_id: UUID,
+        status: DocumentProcessingStatus,
+    ) -> None:
+        """Update document processing status."""
+        from sqlalchemy import update
+        from app.models.document import Document as DocumentModel
+
+        stmt = (
+            update(DocumentModel)
+            .where(DocumentModel.id == document_id)
+            .values(processing_status=status)
+        )
+        await session.execute(stmt)
+        await session.commit()
+
+        logger.info(f"Document {document_id} status updated to {status.value}")
+
+    async def _update_document_metadata(
+        self,
+        session: AsyncSession,
+        document_record: Document,
+        document_title: str,
+        file_name: str,
+        language: str,
+        page_count: Optional[int],
+        chunk_count: int,
+        checksum: str,
+        status: DocumentProcessingStatus,
+    ) -> None:
+        """Update document with full metadata after processing."""
+        document_record.title = document_title
+        document_record.language = language
+        document_record.checksum = checksum
+        document_record.chunk_count = chunk_count
+        document_record.processing_status = status
+        document_record.file_size_bytes = Path(document_record.storage_path).stat().st_size
+        
+        # Safely merge with existing extra_metadata
+        existing_metadata = document_record.extra_metadata or {}
+        existing_chunking = existing_metadata.get("chunking", {})
+        
+        document_record.extra_metadata = {
+            "pages": page_count,
+            "chunking": {
+                "max_tokens": existing_chunking.get("max_tokens"),
+                "overlap_tokens": existing_chunking.get("overlap_tokens"),
+            },
+        }
+
+        await session.flush()
+
+    async def _mark_document_failed(
+        self,
+        session: AsyncSession,
+        document_id: UUID,
+        error_message: str,
+    ) -> None:
+        """Mark document as failed with error message."""
+        from sqlalchemy import update
+        from app.models.document import Document as DocumentModel
+
+        stmt = (
+            update(DocumentModel)
+            .where(DocumentModel.id == document_id)
+            .values(
+                processing_status=DocumentProcessingStatus.FAILED,
+                processing_error=error_message,
+            )
+        )
+        await session.execute(stmt)
+
+        logger.error(f"Document {document_id} marked as FAILED: {error_message}")
 
     async def _persist_chunks(
         self,

@@ -44,6 +44,19 @@ class DocumentVisibility(str, enum.Enum):
     GLOBAL = "global"  # All users across tenants (system docs)
 
 
+class DocumentProcessingStatus(str, enum.Enum):
+    """Processing status for document ingestion pipeline."""
+
+    UPLOADED = "uploaded"  # File uploaded, not yet processed
+    PARSING = "parsing"  # Document is being parsed (Docling)
+    PARSED = "parsed"  # Document parsed successfully
+    CHUNKING = "chunking"  # Document is being chunked
+    CHUNKED = "chunked"  # Document chunked successfully
+    EMBEDDING = "embedding"  # Embeddings are being generated
+    READY = "ready"  # Document is fully processed and ready for search
+    FAILED = "failed"  # Processing failed at any stage
+
+
 # ──────────────────────────────────────────────
 # Model
 # ──────────────────────────────────────────────
@@ -145,6 +158,18 @@ class Document(Base):
         Boolean,
         default=True,
         nullable=False,
+    )
+    processing_status: Mapped[DocumentProcessingStatus] = mapped_column(
+        Enum(DocumentProcessingStatus, name="document_processing_status", create_constraint=True),
+        nullable=False,
+        default=DocumentProcessingStatus.UPLOADED,
+        index=True,
+        comment="Current stage in the ingestion pipeline",
+    )
+    processing_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Error message if processing failed",
     )
     expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

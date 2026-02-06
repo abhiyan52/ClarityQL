@@ -29,40 +29,66 @@ class CallbackTask(CeleryTask):
 
     def on_failure(self, exc, task_id, args, kwargs, einfo):
         """Handle task failure."""
-        logger.error(f"Task {task_id} failed: {exc}")
+        logger.error(f"Celery task {task_id} failed: {exc}")
 
-        # Update task status in database
+        # Extract our Task model ID from kwargs
+        our_task_id = kwargs.get("task_id")
+        if not our_task_id:
+            logger.error(f"No task_id in kwargs for Celery task {task_id}")
+            return
+
+        # Update task status in database using our Task model ID
         with SessionLocal() as session:
-            task = session.query(Task).filter(Task.celery_task_id == task_id).first()
+            task = session.query(Task).filter(Task.id == UUID(our_task_id)).first()
             if task:
                 task.status = TaskStatus.FAILURE
                 task.error_message = str(exc)
                 task.completed_at = datetime.now(timezone.utc)
                 session.commit()
+            else:
+                logger.error(f"Task {our_task_id} not found in database (on_failure)")
 
     def on_success(self, retval, task_id, args, kwargs):
         """Handle task success."""
-        logger.info(f"Task {task_id} completed successfully")
+        logger.info(f"Celery task {task_id} completed successfully")
 
-        # Update task status in database
+        # Extract our Task model ID from kwargs
+        our_task_id = kwargs.get("task_id")
+        if not our_task_id:
+            logger.error(f"No task_id in kwargs for Celery task {task_id}")
+            return
+
+        # Update task status in database using our Task model ID
         with SessionLocal() as session:
-            task = session.query(Task).filter(Task.celery_task_id == task_id).first()
+            task = session.query(Task).filter(Task.id == UUID(our_task_id)).first()
             if task:
                 task.status = TaskStatus.SUCCESS
                 task.result = retval
                 task.completed_at = datetime.now(timezone.utc)
                 session.commit()
+            else:
+                logger.error(f"Task {our_task_id} not found in database (on_success)")
 
     def update_progress(self, task_id: str, current: int, total: int, message: str):
-        """Update task progress in database."""
+        """
+        Update task progress in database.
+        
+        Args:
+            task_id: Our Task model UUID (not Celery task ID).
+            current: Current progress value.
+            total: Total progress value.
+            message: Progress message.
+        """
         with SessionLocal() as session:
-            task = session.query(Task).filter(Task.celery_task_id == task_id).first()
+            task = session.query(Task).filter(Task.id == UUID(task_id)).first()
             if task:
                 task.status = TaskStatus.PROGRESS
                 task.progress_current = current
                 task.progress_total = total
                 task.progress_message = message
                 session.commit()
+            else:
+                logger.error(f"Task {task_id} not found in database (update_progress)")
 
 
 @celery_app.task(
@@ -74,6 +100,7 @@ class CallbackTask(CeleryTask):
 )
 def ingest_document_task(
     self,
+    task_id: str,
     file_path: str,
     document_title: str | None,
     description: str | None,
@@ -88,6 +115,7 @@ def ingest_document_task(
 
     Args:
         self: Celery task instance (injected).
+        task_id: Our Task model UUID (not Celery task ID).
         file_path: Path to uploaded file.
         document_title: Document title.
         description: Document description.
@@ -103,18 +131,25 @@ def ingest_document_task(
     Raises:
         Exception: If ingestion fails (will be retried).
     """
-    task_id = self.request.id
-    logger.info(f"Starting document ingestion task: {task_id}")
+    celery_task_id = self.request.id
+    logger.info(f"Starting document ingestion task: {celery_task_id} (task_id={task_id})")
 
     try:
         # Update task status to STARTED
+        # Use task_id (our Task model ID) instead of celery_task_id to avoid race condition
         with SessionLocal() as session:
-            task = session.query(Task).filter(Task.celery_task_id == task_id).first()
+            task = session.query(Task).filter(Task.id == UUID(task_id)).first()
             if task:
                 task.status = TaskStatus.STARTED
                 task.started_at = datetime.now(timezone.utc)
                 task.progress_message = "Loading document..."
+                # Store celery_task_id if not already set
+                if not task.celery_task_id:
+                    task.celery_task_id = celery_task_id
                 session.commit()
+            else:
+                logger.error(f"Task {task_id} not found in database!")
+                raise ValueError(f"Task {task_id} not found")
 
         # Build ingestion request
         request = IngestionRequest(

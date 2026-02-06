@@ -34,6 +34,19 @@ class SupportedFileType(str, Enum):
     IMAGE = "image"  # Scanned images with OCR
 
 
+class DocumentProcessingStatus(str, Enum):
+    """Processing status for document ingestion pipeline."""
+
+    UPLOADED = "uploaded"  # File uploaded, not yet processed
+    PARSING = "parsing"  # Document is being parsed (Docling)
+    PARSED = "parsed"  # Document parsed successfully
+    CHUNKING = "chunking"  # Document is being chunked
+    CHUNKED = "chunked"  # Document chunked successfully
+    EMBEDDING = "embedding"  # Embeddings are being generated
+    READY = "ready"  # Document is fully processed and ready for search
+    FAILED = "failed"  # Processing failed at any stage
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Chunk Metadata
 # ──────────────────────────────────────────────────────────────────────
@@ -234,6 +247,10 @@ class IngestionResponse(BaseModel):
 
     document_id: UUID = Field(..., description="ID of the created document")
     chunks_created: int = Field(..., description="Number of chunks created")
+    processing_status: DocumentProcessingStatus = Field(
+        ...,
+        description="Current processing status of the document"
+    )
     stats: IngestionStats = Field(..., description="Ingestion statistics")
     processing_time_ms: float = Field(
         ...,
@@ -246,6 +263,7 @@ class IngestionResponse(BaseModel):
             "example": {
                 "document_id": "550e8400-e29b-41d4-a716-446655440000",
                 "chunks_created": 127,
+                "processing_status": "chunked",
                 "stats": {
                     "total_chunks": 127,
                     "total_tokens": 45890,

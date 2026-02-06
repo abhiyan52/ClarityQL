@@ -113,11 +113,22 @@ async def ingest_document_async(
         )
 
         session.add(task)
-        await session.flush()  # Get task.id without committing
+        await session.flush()  # Get task.id
         await session.refresh(task)
+        
+        # ⚠️ EXCEPTIONAL CASE: Commit before queuing Celery task
+        # Normally we let the session dependency handle commits, but here we MUST
+        # commit before queuing because:
+        # 1. The Celery worker runs in a separate process/transaction
+        # 2. It needs to see the Task record immediately when it starts
+        # 3. Without commit, worker's transaction won't see this uncommitted record
+        # 4. This violates our usual "no manual commits" rule, but it's necessary
+        #    for background task coordination
+        await session.commit()
 
-        # Queue Celery task (after task record exists in DB)
+        # Queue Celery task with task.id so worker can find the record immediately
         celery_task = ingest_document_task.delay(
+            task_id=str(task.id),  # Our Task model ID
             file_path=str(file_path),
             document_title=document_title,
             description=description,
@@ -128,10 +139,11 @@ async def ingest_document_async(
             chunk_overlap_tokens=chunk_overlap_tokens,
         )
 
-        # Update task with Celery task ID
-        # Note: Do NOT commit here - the session dependency handles commit
-        # after successful endpoint completion for proper transactional semantics
+        # Update task with Celery task ID for reference
+        # Re-attach to session after commit and update celery_task_id
         task.celery_task_id = celery_task.id
+        session.add(task)  # Re-add to session
+        await session.flush()  # Flush the update
 
         logger.info(
             f"Ingestion task queued: {task.id} (Celery: {celery_task.id})"

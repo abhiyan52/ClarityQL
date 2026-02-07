@@ -160,7 +160,7 @@ class Document(Base):
         nullable=False,
     )
     processing_status: Mapped[DocumentProcessingStatus] = mapped_column(
-        Enum(DocumentProcessingStatus, name="document_processing_status", create_constraint=True),
+        Enum(DocumentProcessingStatus, name="document_processing_status", create_constraint=True, values_callable=lambda x: [e.value for e in x]),
         nullable=False,
         default=DocumentProcessingStatus.UPLOADED,
         index=True,

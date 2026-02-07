@@ -92,11 +92,11 @@ class SQLCompiler:
         group_by_columns: list[ColumnElement] = []
 
         for dim in ast.dimensions:
-            col = self._resolve_column(dim.field)
+            col = self._resolve_dimension_column(dim.field)
             if dim.alias:
                 col = col.label(dim.alias)
             select_columns.append(col)
-            group_by_columns.append(self._resolve_column(dim.field))
+            group_by_columns.append(self._resolve_dimension_column(dim.field))
 
         for metric in ast.metrics:
             expr = self._resolve_metric(metric)
@@ -152,6 +152,14 @@ class SQLCompiler:
         """Resolve a field name to a SQLAlchemy column."""
         table_name, column_name = self._field_to_table_column(field_name)
         return self._tables[table_name].c[column_name]
+
+    def _resolve_dimension_column(self, field_name: str) -> ColumnElement:
+        """Resolve a dimension column, applying date_trunc when configured."""
+        col = self._resolve_column(field_name)
+        field_meta = self._registry.get_field(field_name)
+        if field_meta and field_meta.date_trunc:
+            col = func.date_trunc(field_meta.date_trunc, col)
+        return col
 
     def _field_to_table_column(self, field_name: str) -> tuple[str, str]:
         """Map a field name to (table_name, column_name)."""
@@ -338,7 +346,7 @@ class SQLCompiler:
 
         for dim in ast.dimensions:
             if dim.alias == order.field or dim.field == order.field:
-                col = self._resolve_column(dim.field)
+                col = self._resolve_dimension_column(dim.field)
                 return col.desc() if order.direction.value == "desc" else col.asc()
 
         raise SQLCompileError(

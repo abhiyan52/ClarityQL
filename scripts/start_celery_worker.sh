@@ -28,13 +28,13 @@ export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
 echo "Starting Celery worker with:"
 echo "  - Broker: ${CELERY_BROKER_URL:-redis://127.0.0.1:6379/0}"
 echo "  - Backend: Database"
-echo "  - Queues: rag_ingestion, rag_embeddings, celery"
+echo "  - Queues: rag_ingestion, rag_embeddings, rag_query, nlq, celery"
 echo "  - Pool: solo (to avoid macOS fork issues)"
 
 uv run celery -A app.core.celery_app:celery_app worker \
     --loglevel=info \
     --pool=solo \
-    --queues=rag_ingestion,rag_embeddings,celery \
+    --queues=rag_ingestion,rag_embeddings,rag_query,nlq,celery \
     --max-tasks-per-child=50 \
     --task-events \
     --without-gossip \
@@ -42,4 +42,4 @@ uv run celery -A app.core.celery_app:celery_app worker \
     --without-heartbeat
 
 # Alternative with autoreload for development:
-# uv run watchfiles --filter python 'celery -A app.core.celery_app:celery_app worker --loglevel=info --pool=solo --queues=rag_ingestion,rag_embeddings,celery'
+# uv run watchfiles --filter python 'celery -A app.core.celery_app:celery_app worker --loglevel=info --pool=solo --queues=rag_ingestion,rag_embeddings,rag_query,nlq,celery'

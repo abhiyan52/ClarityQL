@@ -7,6 +7,7 @@ interface ChatState {
   conversations: Conversation[];
   currentConversationId: string | null;
   isLoading: boolean;
+  abortController: AbortController | null;
 
   // Actions
   createConversation: () => string;
@@ -16,6 +17,8 @@ interface ChatState {
   deleteConversation: (id: string) => void;
   clearConversations: () => void;
   setLoading: (loading: boolean) => void;
+  setAbortController: (controller: AbortController | null) => void;
+  cancelCurrentQuery: () => void;
 
   // Selectors
   getCurrentConversation: () => Conversation | undefined;
@@ -28,6 +31,7 @@ export const useChatStore = create<ChatState>()(
       conversations: [],
       currentConversationId: null,
       isLoading: false,
+      abortController: null,
 
       createConversation: () => {
         const id = generateId();
@@ -119,6 +123,18 @@ export const useChatStore = create<ChatState>()(
 
       setLoading: (loading) => {
         set({ isLoading: loading });
+      },
+
+      setAbortController: (controller) => {
+        set({ abortController: controller });
+      },
+
+      cancelCurrentQuery: () => {
+        const state = get();
+        if (state.abortController) {
+          state.abortController.abort();
+          set({ abortController: null, isLoading: false });
+        }
       },
 
       getCurrentConversation: () => {

@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
+from app.models.document import Document, DocumentProcessingStatus
 
 from celery import Task as CeleryTask, group
 from sqlalchemy import create_engine, select, update
@@ -13,8 +14,10 @@ from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.models.task import Task, TaskStatus, TaskType
 from app.schemas.rag import IngestionRequest
+from app.services.rag.answer_generator import RAGAnswerGenerator
 from app.services.rag.document_loader import DocumentLoadError
 from app.services.rag.pipeline import IngestionPipeline
+from app.services.rag.query_service import RAGQueryServiceSync
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -22,6 +25,18 @@ settings = get_settings()
 # Create sync engine for Celery tasks (workers can't use async)
 sync_engine = create_engine(settings.database_url_sync, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=sync_engine)
+
+
+def sanitize_text(text: str | None) -> str | None:
+    """
+    Remove null bytes from text to prevent PostgreSQL insertion errors.
+    
+    PostgreSQL text fields cannot contain NUL (0x00) bytes, which can appear
+    in PDF extractions and other document sources.
+    """
+    if text is None:
+        return None
+    return text.replace('\x00', '')
 
 
 class CallbackTask(CeleryTask):
@@ -33,8 +48,13 @@ class CallbackTask(CeleryTask):
 
         # Extract our Task model ID from kwargs
         our_task_id = kwargs.get("task_id")
+        if not our_task_id and self.name == "app.tasks.rag_tasks.ingest_document_task":
+            our_task_id = task_id
+        
+        # Only try to update Task record if we have a task_id
+        # Some tasks (like generate_embeddings_task) don't use Task records
         if not our_task_id:
-            logger.error(f"No task_id in kwargs for Celery task {task_id}")
+            logger.debug(f"No task_id in kwargs for Celery task {task_id} - skipping Task record update")
             return
 
         # Update task status in database using our Task model ID
@@ -54,8 +74,13 @@ class CallbackTask(CeleryTask):
 
         # Extract our Task model ID from kwargs
         our_task_id = kwargs.get("task_id")
+        if not our_task_id and self.name == "app.tasks.rag_tasks.ingest_document_task":
+            our_task_id = task_id
+        
+        # Only try to update Task record if we have a task_id
+        # Some tasks (like generate_embeddings_task) don't use Task records
         if not our_task_id:
-            logger.error(f"No task_id in kwargs for Celery task {task_id}")
+            logger.debug(f"No task_id in kwargs for Celery task {task_id} - skipping Task record update")
             return
 
         # Update task status in database using our Task model ID
@@ -90,6 +115,15 @@ class CallbackTask(CeleryTask):
             else:
                 logger.error(f"Task {task_id} not found in database (update_progress)")
 
+    def check_revoked(self, task_id: str) -> bool:
+        """Check if the task has been revoked (cancelled by user)."""
+        with SessionLocal() as session:
+            task = session.query(Task).filter(Task.id == UUID(task_id)).first()
+            if task and task.status == TaskStatus.REVOKED:
+                logger.info(f"Task {task_id} was revoked by user")
+                return True
+        return False
+
 
 @celery_app.task(
     bind=True,
@@ -100,7 +134,6 @@ class CallbackTask(CeleryTask):
 )
 def ingest_document_task(
     self,
-    task_id: str,
     file_path: str,
     document_title: str | None,
     description: str | None,
@@ -109,13 +142,13 @@ def ingest_document_task(
     owner_user_id: str,
     max_chunk_tokens: int,
     chunk_overlap_tokens: int,
+    task_id: str | None = None,
 ) -> dict:
     """
     Async task to ingest a document.
 
     Args:
         self: Celery task instance (injected).
-        task_id: Our Task model UUID (not Celery task ID).
         file_path: Path to uploaded file.
         document_title: Document title.
         description: Document description.
@@ -124,6 +157,7 @@ def ingest_document_task(
         owner_user_id: Owner user UUID (string).
         max_chunk_tokens: Max tokens per chunk.
         chunk_overlap_tokens: Overlap tokens.
+        task_id: Optional Task model UUID (defaults to Celery task ID).
 
     Returns:
         Dict with ingestion results.
@@ -132,13 +166,16 @@ def ingest_document_task(
         Exception: If ingestion fails (will be retried).
     """
     celery_task_id = self.request.id
-    logger.info(f"Starting document ingestion task: {celery_task_id} (task_id={task_id})")
+    our_task_id = task_id or celery_task_id
+    logger.info(
+        f"Starting document ingestion task: {celery_task_id} (task_id={our_task_id})"
+    )
 
     try:
         # Update task status to STARTED
-        # Use task_id (our Task model ID) instead of celery_task_id to avoid race condition
+        # Use Task model ID for state updates
         with SessionLocal() as session:
-            task = session.query(Task).filter(Task.id == UUID(task_id)).first()
+            task = session.query(Task).filter(Task.id == UUID(our_task_id)).first()
             if task:
                 task.status = TaskStatus.STARTED
                 task.started_at = datetime.now(timezone.utc)
@@ -148,8 +185,8 @@ def ingest_document_task(
                     task.celery_task_id = celery_task_id
                 session.commit()
             else:
-                logger.error(f"Task {task_id} not found in database!")
-                raise ValueError(f"Task {task_id} not found")
+                logger.error(f"Task {our_task_id} not found in database!")
+                raise ValueError(f"Task {our_task_id} not found")
 
         # Build ingestion request
         request = IngestionRequest(
@@ -167,7 +204,7 @@ def ingest_document_task(
         pipeline = IngestionPipeline()
 
         # Progress: Loading document
-        self.update_progress(task_id, 10, 100, "Parsing document...")
+        self.update_progress(our_task_id, 10, 100, "Parsing document...")
 
         # Note: We need to refactor pipeline to accept sync session
         # For now, we'll use a workaround with sync session
@@ -177,7 +214,7 @@ def ingest_document_task(
             # Refactor needed: Convert pipeline to use sync session
             # This is a placeholder - actual implementation needs async->sync conversion
 
-            self.update_progress(task_id, 30, 100, "Extracting text...")
+            self.update_progress(our_task_id, 30, 100, "Extracting text...")
 
             # Load document
             from app.services.rag.document_loader import DoclingDocumentLoader
@@ -185,7 +222,7 @@ def ingest_document_task(
             loader = DoclingDocumentLoader()
             doc = loader.load(request.file_path)
 
-            self.update_progress(task_id, 50, 100, "Chunking content...")
+            self.update_progress(our_task_id, 50, 100, "Chunking content...")
 
             # Extract elements and chunk
             elements = loader.extract_text_elements(doc)
@@ -200,7 +237,7 @@ def ingest_document_task(
                 sample_texts = [text for text, _ in elements[:5]]
                 request.language = detect_language_from_multiple_samples(sample_texts)
 
-            self.update_progress(task_id, 70, 100, "Creating chunks...")
+            self.update_progress(our_task_id, 70, 100, "Creating chunks...")
 
             # Chunk
             chunker = SemanticChunker(
@@ -220,7 +257,7 @@ def ingest_document_task(
                 language=request.language,
             )
 
-            self.update_progress(task_id, 90, 100, "Saving to database...")
+            self.update_progress(our_task_id, 90, 100, "Saving to database...")
 
             # Persist to database (sync)
             import hashlib
@@ -239,34 +276,77 @@ def ingest_document_task(
                     sha256.update(chunk_data)
             checksum = sha256.hexdigest()
 
-            # Create document
-            document = DocumentModel(
-                tenant_id=request.tenant_id,
-                owner_user_id=request.owner_user_id,
-                title=document_title,
-                description=request.description,
-                source_type=DocumentSourceType.UPLOADED,
-                visibility=DocumentVisibility.TENANT,
-                storage_path=request.file_path,
-                mime_type=None,
-                checksum=checksum,
-                file_size_bytes=Path(request.file_path).stat().st_size,
-                version=1,
-                language=request.language,
-                is_active=True,
-                processing_status=DocumentProcessingStatus.CHUNKED,  # Set to CHUNKED, not READY
-                chunk_count=len(chunks),
-                extra_metadata={
+            # Check if document with this checksum already exists
+            existing_document = (
+                db_session.query(DocumentModel)
+                .filter(
+                    DocumentModel.tenant_id == request.tenant_id,
+                    DocumentModel.checksum == checksum,
+                )
+                .first()
+            )
+
+            if existing_document:
+                # Document already exists - reprocess it
+                logger.info(
+                    f"Document already exists (checksum={checksum}), reprocessing: {existing_document.id}"
+                )
+                
+                # Delete old chunks
+                db_session.query(ChunkModel).filter(
+                    ChunkModel.document_id == existing_document.id
+                ).delete()
+                
+                # Update existing document
+                document = existing_document
+                document.title = sanitize_text(document_title) or document.title
+                if request.description:
+                    document.description = sanitize_text(request.description)
+                document.storage_path = request.file_path
+                document.file_size_bytes = Path(request.file_path).stat().st_size
+                document.version += 1
+                document.language = request.language
+                document.is_active = True
+                document.processing_status = DocumentProcessingStatus.CHUNKED
+                document.processing_error = None
+                document.chunk_count = len(chunks)
+                document.extra_metadata = {
                     "pages": loader.get_page_count(doc),
                     "chunking": {
                         "max_tokens": request.max_chunk_tokens,
                         "overlap_tokens": request.chunk_overlap_tokens,
                     },
-                },
-            )
-
-            db_session.add(document)
-            db_session.flush()
+                    "reprocessed": True,
+                }
+                db_session.flush()
+            else:
+                # Create new document
+                document = DocumentModel(
+                    tenant_id=request.tenant_id,
+                    owner_user_id=request.owner_user_id,
+                    title=sanitize_text(document_title) or "Untitled Document",
+                    description=sanitize_text(request.description),
+                    source_type=DocumentSourceType.UPLOADED,
+                    visibility=DocumentVisibility.TENANT,
+                    storage_path=request.file_path,
+                    mime_type=None,
+                    checksum=checksum,
+                    file_size_bytes=Path(request.file_path).stat().st_size,
+                    version=1,
+                    language=request.language,
+                    is_active=True,
+                    processing_status=DocumentProcessingStatus.CHUNKED,  # Set to CHUNKED, not READY
+                    chunk_count=len(chunks),
+                    extra_metadata={
+                        "pages": loader.get_page_count(doc),
+                        "chunking": {
+                            "max_tokens": request.max_chunk_tokens,
+                            "overlap_tokens": request.chunk_overlap_tokens,
+                        },
+                    },
+                )
+                db_session.add(document)
+                db_session.flush()
 
             # Create chunks
             for chunk in chunks:
@@ -275,9 +355,9 @@ def ingest_document_task(
                     tenant_id=request.tenant_id,
                     chunk_index=chunk.metadata.chunk_index,
                     page_number=chunk.metadata.page_number,
-                    section=chunk.metadata.section_title,
+                    section=sanitize_text(chunk.metadata.section_title),
                     language=chunk.metadata.language,
-                    content=chunk.content,
+                    content=sanitize_text(chunk.content),
                     token_count=chunk.metadata.token_count,
                     embedding=None,
                     extra_metadata=chunk.metadata.extra,
@@ -293,6 +373,7 @@ def ingest_document_task(
             result = {
                 "document_id": str(document.id),
                 "chunks_created": len(chunks),
+                "reprocessed": existing_document is not None,
                 "stats": {
                     "total_chunks": len(chunks),
                     "total_tokens": total_tokens,
@@ -302,9 +383,14 @@ def ingest_document_task(
                 },
             }
 
-            logger.info(
-                f"Document ingested successfully: {document.id} ({len(chunks)} chunks)"
-            )
+            if existing_document:
+                logger.info(
+                    f"Document reprocessed successfully: {document.id} ({len(chunks)} chunks, version {document.version})"
+                )
+            else:
+                logger.info(
+                    f"Document ingested successfully: {document.id} ({len(chunks)} chunks)"
+                )
 
             # Queue embedding generation task after successful ingestion
             # This runs separately to avoid Celery timeout issues
@@ -552,8 +638,6 @@ def generate_embeddings_for_pending_documents_task(self) -> dict:
     celery_task_id = self.request.id
     logger.info(f"Starting pending documents embedding task: {celery_task_id}")
 
-    from app.models.document import Document, DocumentProcessingStatus
-
     try:
         with SessionLocal() as session:
             # Find all documents that are chunked but not yet embedded
@@ -596,4 +680,113 @@ def generate_embeddings_for_pending_documents_task(self) -> dict:
         logger.error(
             f"Failed to process pending documents: {e}", exc_info=True
         )
+        raise
+
+
+@celery_app.task(
+    bind=True,
+    base=CallbackTask,
+    name="app.tasks.rag_tasks.process_rag_query_task",
+    soft_time_limit=120,
+    time_limit=150,
+    max_retries=0,
+)
+def process_rag_query_task(
+    self,
+    task_id: str,
+    query: str,
+    user_id: str,
+    tenant_id: str,
+    document_ids: list[str] | None = None,
+    conversation_id: str | None = None,
+    top_k: int = 5,
+    min_similarity: float = 0.0,
+) -> dict:
+    """
+    Process a RAG query in the background with progress updates.
+    
+    Args:
+        task_id: Task UUID for progress tracking.
+        query: User's natural language query.
+        user_id: User UUID.
+        tenant_id: Tenant UUID.
+        document_ids: Optional list of document UUIDs to search within.
+        conversation_id: Optional conversation UUID for context.
+        top_k: Number of top results to return.
+        min_similarity: Minimum similarity threshold 0-1.
+    
+    Returns:
+        Dict containing RAGQueryResponse data with answer.
+    """
+    logger.info(f"Starting RAG query task {task_id} for user {user_id}")
+
+    # Check for revocation
+    if self.check_revoked(task_id):
+        return {}
+
+    try:
+        # Step 1: Retrieve chunks
+        self.update_progress(task_id, 10, 100, "Searching documents...")
+        
+        # Convert document_ids to UUIDs if provided
+        document_uuids = None
+        if document_ids:
+            document_uuids = [UUID(doc_id) for doc_id in document_ids]
+        
+        conversation_uuid = None
+        if conversation_id:
+            conversation_uuid = UUID(conversation_id)
+
+        # Use sync RAG query (async SQLAlchemy/asyncpg conflicts with Celery event loop)
+        with SessionLocal() as session:
+            rag_service = RAGQueryServiceSync(session)
+            rag_result = rag_service.query(
+                query=query,
+                tenant_id=UUID(tenant_id),
+                user_id=UUID(user_id),
+                document_ids=document_uuids,
+                conversation_id=conversation_uuid,
+                top_k=top_k,
+                min_similarity=min_similarity,
+            )
+            session.commit()
+
+        if self.check_revoked(task_id):
+            return {}
+
+        # Step 2: Generate answer with LLM
+        self.update_progress(task_id, 60, 100, "Generating answer...")
+        
+        answer_generator = RAGAnswerGenerator()
+        
+        # Generate answer from chunks
+        answer = answer_generator.generate(
+            query=query,
+            chunks=rag_result.get("chunks", []),
+            conversation_history=None,  # TODO: Load conversation history if needed
+        )
+
+        if self.check_revoked(task_id):
+            return {}
+
+        # Step 3: Format response
+        self.update_progress(task_id, 80, 100, "Finalizing response...")
+
+        result_dict = {
+            "conversation_id": rag_result["conversation_id"],
+            "query": query,
+            "answer": answer,
+            "chunks": rag_result["chunks"],
+            "documents": rag_result["documents"],
+            "total_chunks_found": rag_result["total_chunks_found"],
+        }
+
+        self.update_progress(task_id, 100, 100, "Complete!")
+        
+        logger.info(f"RAG query task {task_id} completed successfully")
+        return result_dict
+
+    except Exception as e:
+        logger.error(f"RAG query task {task_id} failed: {e}", exc_info=True)
+        # Error will be handled by CallbackTask.on_failure
         raise

@@ -27,9 +27,11 @@ class TaskStatus(str, Enum):
 class TaskType(str, Enum):
     """Type of async task."""
 
-    DOCUMENT_INGESTION = "document_ingestion"
-    EMBEDDING_GENERATION = "embedding_generation"
-    DOCUMENT_DELETION = "document_deletion"
+    DOCUMENT_INGESTION = "DOCUMENT_INGESTION"
+    EMBEDDING_GENERATION = "EMBEDDING_GENERATION"
+    DOCUMENT_DELETION = "DOCUMENT_DELETION"
+    NLQ_QUERY = "NLQ_QUERY"
+    RAG_QUERY = "RAG_QUERY"
 
 
 class Task(Base):

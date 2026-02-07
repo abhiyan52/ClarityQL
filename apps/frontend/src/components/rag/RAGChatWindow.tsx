@@ -1,12 +1,14 @@
 import { useState, useRef, useEffect } from "react";
-import { Send, Loader2, FileText, MessageSquarePlus, ExternalLink } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import { Send, Loader2, FileText, MessageSquarePlus, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Card } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import { Bot, User } from "lucide-react";
-import { queryDocuments, type ChunkResult } from "@/api/rag";
+import { submitQuery, streamTaskProgress, cancelTask, type ChunkResult, type RAGQueryResponse } from "@/api/rag";
 
 interface RAGChatWindowProps {
   selectedDocuments: string[];
@@ -19,8 +21,12 @@ interface Message {
   content: string;
   timestamp: Date;
   isLoading?: boolean;
+  progressPercentage?: number;
+  progressMessage?: string;
+  taskId?: string;
   chunks?: ChunkResult[];
   conversationId?: string;
+  error?: string;
 }
 
 export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWindowProps) {
@@ -28,6 +34,7 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [conversationId, setConversationId] = useState<string | undefined>();
+  const [abortController, setAbortController] = useState<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -47,6 +54,28 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
     }
   }, [input]);
 
+  const updateMessage = (id: string, updates: Partial<Message>) => {
+    setMessages(prev =>
+      prev.map(msg => (msg.id === id ? { ...msg, ...updates } : msg))
+    );
+  };
+
+  const handleCancel = async () => {
+    if (abortController) {
+      // Find the current loading message to get task ID
+      const loadingMessage = messages.find(m => m.isLoading && m.taskId);
+      if (loadingMessage?.taskId) {
+        try {
+          await cancelTask(loadingMessage.taskId);
+        } catch (error) {
+          console.error("Failed to cancel task:", error);
+        }
+      }
+      abortController.abort();
+      setAbortController(null);
+    }
+  };
+
   const handleSend = async () => {
     const trimmed = input.trim();
     if (!trimmed || isLoading) return;
@@ -64,21 +93,23 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
     setIsLoading(true);
 
     // Add loading assistant message
-    const loadingId = (Date.now() + 1).toString();
+    const assistantId = (Date.now() + 1).toString();
     setMessages(prev => [
       ...prev,
       {
-        id: loadingId,
+        id: assistantId,
         role: "assistant",
         content: "",
         timestamp: new Date(),
         isLoading: true,
+        progressPercentage: 0,
+        progressMessage: "Starting query...",
       },
     ]);
 
     try {
-      // Call real RAG API
-      const response = await queryDocuments({
+      // Step 1: Submit query for background processing
+      const { task_id } = await submitQuery({
         query: trimmed,
         document_ids: selectedDocuments.length > 0 ? selectedDocuments : undefined,
         conversation_id: conversationId,
@@ -86,44 +117,77 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
         min_similarity: 0.0,
       });
 
-      // Update conversation ID for context continuity
-      setConversationId(response.conversation_id);
+      // Update message with task ID
+      updateMessage(assistantId, {
+        taskId: task_id,
+      });
 
-      // Format response message
-      const chunksText = response.chunks.length > 0
-        ? `I found ${response.total_chunks_found} relevant ${response.total_chunks_found === 1 ? 'passage' : 'passages'} across ${response.documents.length} ${response.documents.length === 1 ? 'document' : 'documents'}:`
-        : "I couldn't find any relevant information in the selected documents for your query.";
+      // Step 2: Stream progress via SSE
+      const controller = streamTaskProgress(task_id, {
+        onProgress: (data) => {
+          updateMessage(assistantId, {
+            progressPercentage: data.percentage,
+            progressMessage: data.message,
+          });
+        },
+        onComplete: (response: RAGQueryResponse) => {
+          // Update conversation ID for context continuity
+          setConversationId(response.conversation_id);
 
-      setMessages(prev =>
-        prev.map(msg =>
-          msg.id === loadingId
-            ? {
-                ...msg,
-                content: chunksText,
-                isLoading: false,
-                chunks: response.chunks,
-                conversationId: response.conversation_id,
-              }
-            : msg
-        )
-      );
+          updateMessage(assistantId, {
+            content: response.answer || "I couldn't find any relevant information in the selected documents for your query.",
+            chunks: response.chunks,
+            conversationId: response.conversation_id,
+            isLoading: false,
+            progressPercentage: undefined,
+            progressMessage: undefined,
+          });
+          setIsLoading(false);
+          setAbortController(null);
+        },
+        onError: (error) => {
+          updateMessage(assistantId, {
+            content: `Sorry, I couldn't process your request. ${error}`,
+            isLoading: false,
+            progressPercentage: undefined,
+            progressMessage: undefined,
+            error: error,
+          });
+          setIsLoading(false);
+          setAbortController(null);
+        },
+        onCancelled: () => {
+          updateMessage(assistantId, {
+            content: "Query was cancelled.",
+            isLoading: false,
+            progressPercentage: undefined,
+            progressMessage: undefined,
+          });
+          setIsLoading(false);
+          setAbortController(null);
+        },
+      });
+
+      // Store controller so cancel button can use it
+      setAbortController(controller);
     } catch (error) {
-      console.error("RAG query failed:", error);
-      const errorMessage = error instanceof Error ? error.message : "An error occurred";
-      
-      setMessages(prev =>
-        prev.map(msg =>
-          msg.id === loadingId
-            ? {
-                ...msg,
-                content: `Sorry, I encountered an error: ${errorMessage}`,
-                isLoading: false,
-              }
-            : msg
-        )
-      );
-    } finally {
+      let errorMessage = "Please try again.";
+      if (error instanceof Error) {
+        errorMessage = error.message;
+      } else if (typeof error === "string") {
+        errorMessage = error;
+      } else if (error && typeof error === "object") {
+        errorMessage = JSON.stringify(error);
+      }
+      updateMessage(assistantId, {
+        content: `Sorry, I couldn't submit your query. ${errorMessage}`,
+        isLoading: false,
+        progressPercentage: undefined,
+        progressMessage: undefined,
+        error: errorMessage,
+      });
       setIsLoading(false);
+      setAbortController(null);
     }
   };
 
@@ -165,7 +229,11 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
         ) : (
           <div className="divide-y">
             {messages.map(message => (
-              <ChatMessage key={message.id} message={message} />
+              <ChatMessage 
+                key={message.id} 
+                message={message} 
+                onCancel={handleCancel}
+              />
             ))}
           </div>
         )}
@@ -219,9 +287,10 @@ interface ChatMessageProps {
   message: Message;
 }
 
-function ChatMessage({ message }: ChatMessageProps) {
+function ChatMessage({ message, onCancel }: ChatMessageProps & { onCancel: () => void }) {
   const isUser = message.role === "user";
   const isLoading = message.isLoading;
+  const hasProgress = typeof message.progressPercentage === 'number';
 
   return (
     <div
@@ -251,10 +320,22 @@ function ChatMessage({ message }: ChatMessageProps) {
         </div>
 
         {isLoading ? (
-          <LoadingIndicator />
+          <LoadingIndicator 
+            message={message} 
+            onCancel={onCancel}
+          />
         ) : (
           <>
-            <p className="text-sm leading-relaxed whitespace-pre-wrap">{message.content}</p>
+            <div className={cn(
+              "text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none",
+              message.error && "text-destructive"
+            )}>
+              {isUser ? (
+                <p className="whitespace-pre-wrap">{message.content}</p>
+              ) : (
+                <ReactMarkdown>{message.content}</ReactMarkdown>
+              )}
+            </div>
             {message.chunks && message.chunks.length > 0 && (
               <ChunkResults chunks={message.chunks} />
             )}
@@ -300,12 +381,45 @@ function ChunkResults({ chunks }: ChunkResultsProps) {
   );
 }
 
-function LoadingIndicator() {
+function LoadingIndicator({ 
+  message, 
+  onCancel 
+}: { 
+  message: Message;
+  onCancel: () => void;
+}) {
+  const hasProgress = typeof message.progressPercentage === 'number';
+
   return (
-    <div className="flex items-center gap-1">
-      <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
-      <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
-      <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+    <div className="space-y-2">
+      {hasProgress ? (
+        <>
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              {message.progressMessage || "Processing..."}
+            </p>
+            <span className="text-xs text-muted-foreground">
+              {Math.round(message.progressPercentage || 0)}%
+            </span>
+          </div>
+          <Progress value={message.progressPercentage} className="h-1" />
+        </>
+      ) : (
+        <div className="flex items-center gap-1">
+          <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+          <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+          <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+        </div>
+      )}
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onCancel}
+        className="mt-2"
+      >
+        <X className="mr-1 h-3 w-3" />
+        Cancel
+      </Button>
     </div>
   );
 }

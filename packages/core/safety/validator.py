@@ -11,6 +11,7 @@ from packages.core.schema_registry.registry import (
     get_default_registry,
 )
 from packages.core.sql_ast.models import (
+    AggregateFunction,
     Dimension,
     Filter,
     FilterOperator,
@@ -145,7 +146,11 @@ class ASTValidator:
             if self._registry.get_derived_metric(metric.field) is not None:
                 continue
 
-            # Physical field - check if aggregatable
+            # COUNT and COUNT_DISTINCT work on any field (counting non-null values)
+            if metric.function in (AggregateFunction.COUNT, AggregateFunction.COUNT_DISTINCT):
+                continue
+
+            # Physical field - check if aggregatable for SUM/AVG/MIN/MAX
             field_meta = self._registry.get_field(metric.field)
             if field_meta and not field_meta.aggregatable:
                 raise ASTValidationError(

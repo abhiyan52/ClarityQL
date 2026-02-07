@@ -1,19 +1,26 @@
 """RAG ingestion API routes with async task support."""
 
+import asyncio
+import json
 import logging
+from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status, UploadFile, File, BackgroundTasks, Body
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Body
+from fastapi.responses import JSONResponse, StreamingResponse
+from sqlalchemy import select
 
+from app.core.celery_app import celery_app
 from app.core.dependencies import AsyncSessionDep, CurrentUser
+from app.db.session import async_session_factory
 from app.models.task import Task, TaskStatus, TaskType
 from app.tasks.rag_tasks import (
     ingest_document_task,
     generate_embeddings_task,
     generate_embeddings_batch_task,
     generate_embeddings_for_pending_documents_task,
+    process_rag_query_task,
 )
 from app.services.rag.query_service import RAGQueryService
 from pydantic import BaseModel, Field
@@ -66,6 +73,7 @@ class RAGQueryResponse(BaseModel):
 
     conversation_id: str
     query: str
+    answer: str
     chunks: list[ChunkResult]
     documents: list[dict]
     total_chunks_found: int
@@ -76,17 +84,18 @@ class RAGQueryResponse(BaseModel):
 # ──────────────────────────────────────────────
 
 
-@router.post("/query", response_model=RAGQueryResponse)
+@router.post("/query", status_code=status.HTTP_202_ACCEPTED)
 async def query_documents(
     request: RAGQueryRequest,
     session: AsyncSessionDep,
     current_user: CurrentUser,
-) -> RAGQueryResponse:
+) -> dict:
     """
-    Query documents using semantic search.
+    Submit a RAG query for background processing.
 
-    Embeds the user's query and finds the most similar chunks from the specified
-    documents (or all documents if none specified).
+    This endpoint creates a task and returns immediately with a task_id.
+    The client should then connect to /tasks/{task_id}/stream to receive
+    progress updates and final results via Server-Sent Events (SSE).
 
     Args:
         request: Query request with query text, optional document IDs, etc.
@@ -94,13 +103,11 @@ async def query_documents(
         current_user: Authenticated user (injected)
 
     Returns:
-        RAGQueryResponse with matching chunks and metadata
+        Dict with task_id for progress tracking
 
     Raises:
         HTTPException 400: If document IDs are invalid
-        HTTPException 404: If conversation not found
-        HTTPException 403: If user doesn't own conversation
-        HTTPException 500: If query processing fails
+        HTTPException 500: If task creation fails
 
     Example:
         ```bash
@@ -115,208 +122,255 @@ async def query_documents(
         ```
     """
     try:
-        # Parse document IDs if provided
+        # Validate document IDs if provided
         document_ids = None
         if request.document_ids:
             try:
-                document_ids = [UUID(doc_id) for doc_id in request.document_ids]
+                # Validate UUID format but keep as strings for Celery task
+                for doc_id in request.document_ids:
+                    UUID(doc_id)
+                document_ids = request.document_ids
             except ValueError as e:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail=f"Invalid document ID format: {str(e)}",
                 )
 
-        # Parse conversation ID if provided
+        # Validate conversation ID if provided
         conversation_id = None
         if request.conversation_id:
             try:
-                conversation_id = UUID(request.conversation_id)
+                UUID(request.conversation_id)
+                conversation_id = request.conversation_id
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid conversation ID format",
                 )
 
-        # Execute query
-        rag_service = RAGQueryService(session)
-        result = await rag_service.query(
-            query=request.query,
+        # Create task record
+        task = Task(
             tenant_id=current_user.tenant_id,
             user_id=current_user.id,
-            document_ids=document_ids,
-            conversation_id=conversation_id,
-            top_k=request.top_k,
-            min_similarity=request.min_similarity,
+            task_type=TaskType.RAG_QUERY,
+            task_name=f"RAG Query: {request.query[:50]}...",
+            task_args={
+                "query": request.query,
+                "document_ids": document_ids,
+                "conversation_id": conversation_id,
+                "top_k": request.top_k,
+                "min_similarity": request.min_similarity,
+            },
+            status=TaskStatus.PENDING,
+            progress_current=0,
+            progress_total=100,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+
+        # Dispatch Celery task
+        celery_result = process_rag_query_task.apply_async(
+            kwargs={
+                "task_id": str(task.id),
+                "query": request.query,
+                "user_id": str(current_user.id),
+                "tenant_id": str(current_user.tenant_id),
+                "document_ids": document_ids,
+                "conversation_id": conversation_id,
+                "top_k": request.top_k,
+                "min_similarity": request.min_similarity,
+            }
         )
 
-        return RAGQueryResponse(**result)
+        # Update task with Celery task ID
+        task.celery_task_id = celery_result.id
+        task.started_at = datetime.utcnow()
+        await session.commit()
 
-    except PermissionError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e),
-        )
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e),
-        )
+        return {"task_id": str(task.id)}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"RAG query failed: {e}", exc_info=True)
+        logger.error(f"RAG query submission failed: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query processing failed: {str(e)}",
+            detail=f"Query submission failed: {str(e)}",
         )
+
+
+# ──────────────────────────────────────────────
+# RAG Query Task Streaming and Cancellation
+# ──────────────────────────────────────────────
+
+
+@router.get("/tasks/{task_id}/stream")
+async def stream_rag_task_status(
+    task_id: UUID,
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+):
+    """
+    Stream RAG task progress and results via Server-Sent Events (SSE).
+
+    Opens an SSE connection that emits progress updates and the final result.
+
+    Event types:
+    - progress: { percentage, message, current, total }
+    - complete: { full RAGQueryResponse data }
+    - error: { error, error_type }
+    - cancelled: { message }
+
+    Args:
+        task_id: The task UUID to stream.
+        current_user: Authenticated user (from JWT).
+        session: Database session.
+
+    Returns:
+        StreamingResponse with text/event-stream content type.
+
+    Raises:
+        HTTPException 403: If task belongs to another user.
+        HTTPException 404: If task not found.
+    """
+    # Verify task exists and user owns it
+    result = await session.execute(
+        select(Task).where(Task.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        )
+
+    if task.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this task",
+        )
+
+    async def event_generator():
+        """Generate SSE events from task status."""
+        last_progress = None
+
+        while True:
+            # IMPORTANT: create a fresh session each poll so we see
+            # the latest data committed by the Celery worker.
+            async with async_session_factory() as poll_session:
+                result = await poll_session.execute(
+                    select(Task).where(Task.id == task_id)
+                )
+                current_task = result.scalar_one_or_none()
+                
+                if not current_task:
+                    data = {"error": "Task not found", "error_type": "task_deleted"}
+                    yield f"event: error\ndata: {json.dumps(data)}\n\n"
+                    return
+
+                task_status = current_task.status
+
+                if task_status == TaskStatus.PROGRESS:
+                    current_progress = (current_task.progress_current, current_task.progress_message)
+                    if current_progress != last_progress:
+                        data = {
+                            "percentage": current_task.progress_percentage,
+                            "message": current_task.progress_message or "",
+                            "current": current_task.progress_current,
+                            "total": current_task.progress_total,
+                        }
+                        yield f"event: progress\ndata: {json.dumps(data)}\n\n"
+                        last_progress = current_progress
+
+                elif task_status == TaskStatus.SUCCESS:
+                    yield f"event: complete\ndata: {json.dumps(current_task.result)}\n\n"
+                    return
+
+                elif task_status == TaskStatus.FAILURE:
+                    data = {
+                        "error": current_task.error_message or "Unknown error",
+                        "error_type": "task_failure",
+                    }
+                    yield f"event: error\ndata: {json.dumps(data)}\n\n"
+                    return
+
+                elif task_status == TaskStatus.REVOKED:
+                    data = {"message": "Task was cancelled"}
+                    yield f"event: cancelled\ndata: {json.dumps(data)}\n\n"
+                    return
+
+            # Wait before next poll
+            await asyncio.sleep(1)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
+        },
+    )
+
+
+@router.post("/tasks/{task_id}/cancel")
+async def cancel_rag_task(
+    task_id: UUID,
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+) -> dict:
+    """
+    Cancel a running RAG task.
+
+    Revokes the Celery task and marks it as REVOKED in the database.
+
+    Args:
+        task_id: The task UUID to cancel.
+        current_user: Authenticated user (from JWT).
+        session: Database session.
+
+    Returns:
+        Confirmation message.
+
+    Raises:
+        HTTPException 403: If task belongs to another user.
+        HTTPException 404: If task not found.
+    """
+    # Verify task exists and user owns it
+    result = await session.execute(
+        select(Task).where(Task.id == task_id)
+    )
+    task = result.scalar_one_or_none()
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Task not found",
+        )
+
+    if task.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this task",
+        )
+
+    # Revoke Celery task
+    if task.celery_task_id:
+        celery_app.control.revoke(task.celery_task_id, terminate=True)
+
+    # Update task status
+    task.status = TaskStatus.REVOKED
+    task.completed_at = datetime.utcnow()
+    await session.commit()
+
+    return {"message": "Task cancelled successfully"}
 
 
 # ──────────────────────────────────────────────
 # Document Ingestion Endpoints
 # ──────────────────────────────────────────────
-
-
-# ──────────────────────────────────────────────
-# Request/Response Schemas
-# ──────────────────────────────────────────────
-
-
-class RAGQueryRequest(BaseModel):
-    """Request schema for RAG query."""
-
-    query: str = Field(..., min_length=1, max_length=5000, description="User query")
-    document_ids: list[str] | None = Field(
-        None, description="Optional list of document IDs to search (None = all)"
-    )
-    conversation_id: str | None = Field(
-        None, description="Optional conversation ID for context"
-    )
-    top_k: int = Field(5, ge=1, le=50, description="Number of results to return")
-    min_similarity: float = Field(
-        0.0, ge=0.0, le=1.0, description="Minimum similarity threshold"
-    )
-
-
-class ChunkResult(BaseModel):
-    """A single chunk result from RAG query."""
-
-    chunk_id: str
-    document_id: str
-    document_title: str
-    content: str
-    page_number: int | None
-    section: str | None
-    chunk_index: int
-    similarity_score: float
-    token_count: int | None
-
-
-class RAGQueryResponse(BaseModel):
-    """Response schema for RAG query."""
-
-    conversation_id: str
-    query: str
-    chunks: list[ChunkResult]
-    documents: list[dict]
-    total_chunks_found: int
-
-
-# ──────────────────────────────────────────────
-# RAG Query Endpoint
-# ──────────────────────────────────────────────
-
-
-@router.post("/query", response_model=RAGQueryResponse)
-async def query_documents(
-    request: RAGQueryRequest,
-    session: AsyncSessionDep,
-    current_user: CurrentUser,
-) -> RAGQueryResponse:
-    """
-    Query documents using semantic search.
-
-    Embeds the user's query and finds the most similar chunks from the specified
-    documents (or all documents if none specified).
-
-    Args:
-        request: Query request with query text, optional document IDs, etc.
-        session: Database session (injected)
-        current_user: Authenticated user (injected)
-
-    Returns:
-        RAGQueryResponse with matching chunks and metadata
-
-    Raises:
-        HTTPException 400: If document IDs are invalid
-        HTTPException 404: If conversation not found
-        HTTPException 403: If user doesn't own conversation
-        HTTPException 500: If query processing fails
-
-    Example:
-        ```bash
-        curl -X POST http://localhost:8000/api/rag/query \\
-          -H "Authorization: Bearer <token>" \\
-          -H "Content-Type: application/json" \\
-          -d '{
-            "query": "What are the key findings?",
-            "document_ids": ["uuid1", "uuid2"],
-            "top_k": 5
-          }'
-        ```
-    """
-    try:
-        # Parse document IDs if provided
-        document_ids = None
-        if request.document_ids:
-            try:
-                document_ids = [UUID(doc_id) for doc_id in request.document_ids]
-            except ValueError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid document ID format: {str(e)}",
-                )
-
-        # Parse conversation ID if provided
-        conversation_id = None
-        if request.conversation_id:
-            try:
-                conversation_id = UUID(request.conversation_id)
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid conversation ID format",
-                )
-
-        # Execute query
-        rag_service = RAGQueryService(session)
-        result = await rag_service.query(
-            query=request.query,
-            tenant_id=current_user.tenant_id,
-            user_id=current_user.id,
-            document_ids=document_ids,
-            conversation_id=conversation_id,
-            top_k=request.top_k,
-            min_similarity=request.min_similarity,
-        )
-
-        return RAGQueryResponse(**result)
-
-    except PermissionError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e),
-        )
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e),
-        )
-    except Exception as e:
-        logger.error(f"RAG query failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query processing failed: {str(e)}",
-        )
-
-
 # ──────────────────────────────────────────────
 # Document Ingestion Endpoints
 # ──────────────────────────────────────────────
@@ -399,6 +453,34 @@ async def ingest_document_async(
                 detail=f"Failed to save file: {str(e)}",
             )
 
+        # Check for duplicate document by checksum
+        import hashlib
+        from app.models.document import Document as DocumentModel
+        
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk_data in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk_data)
+        checksum = sha256.hexdigest()
+        
+        # Check if document already exists
+        from sqlalchemy import select
+        result = await session.execute(
+            select(DocumentModel).where(
+                DocumentModel.tenant_id == current_user.tenant_id,
+                DocumentModel.checksum == checksum,
+            )
+        )
+        existing_doc = result.scalar_one_or_none()
+        
+        if existing_doc:
+            logger.info(
+                f"Duplicate document detected (checksum={checksum}), will reprocess: {existing_doc.id}"
+            )
+            message = f"Document already exists. Reprocessing with new settings."
+        else:
+            message = "Document upload successful. Processing in background."
+
         # Create task record in database first (before queueing Celery task)
         # This prevents race conditions where the worker starts before the DB commit
         task = Task(
@@ -418,6 +500,9 @@ async def ingest_document_async(
         session.add(task)
         await session.flush()  # Get task.id
         await session.refresh(task)
+
+        # Use Task ID as Celery task ID to avoid races updating celery_task_id
+        task.celery_task_id = str(task.id)
         
         # ⚠️ EXCEPTIONAL CASE: Commit before queuing Celery task
         # Normally we let the session dependency handle commits, but here we MUST
@@ -429,24 +514,20 @@ async def ingest_document_async(
         #    for background task coordination
         await session.commit()
 
-        # Queue Celery task with task.id so worker can find the record immediately
-        celery_task = ingest_document_task.delay(
-            task_id=str(task.id),  # Our Task model ID
-            file_path=str(file_path),
-            document_title=document_title,
-            description=description,
-            language=language,
-            tenant_id=str(current_user.tenant_id),
-            owner_user_id=str(current_user.id),
-            max_chunk_tokens=max_chunk_tokens,
-            chunk_overlap_tokens=chunk_overlap_tokens,
+        # Queue Celery task with Task ID as Celery task ID
+        celery_task = ingest_document_task.apply_async(
+            kwargs={
+                "file_path": str(file_path),
+                "document_title": document_title,
+                "description": description,
+                "language": language,
+                "tenant_id": str(current_user.tenant_id),
+                "owner_user_id": str(current_user.id),
+                "max_chunk_tokens": max_chunk_tokens,
+                "chunk_overlap_tokens": chunk_overlap_tokens,
+            },
+            task_id=str(task.id),
         )
-
-        # Update task with Celery task ID for reference
-        # Re-attach to session after commit and update celery_task_id
-        task.celery_task_id = celery_task.id
-        session.add(task)  # Re-add to session
-        await session.commit()  # Commit to persist celery_task_id
 
         logger.info(
             f"Ingestion task queued: {task.id} (Celery: {celery_task.id})"
@@ -458,7 +539,9 @@ async def ingest_document_async(
                 "task_id": str(task.id),
                 "celery_task_id": celery_task.id,
                 "status": task.status.value,
-                "message": "Document upload successful. Processing in background.",
+                "message": message,
+                "is_reprocessing": existing_doc is not None,
+                "existing_document_id": str(existing_doc.id) if existing_doc else None,
                 "status_url": f"/api/rag/tasks/{task.id}",
             },
         )

@@ -5,8 +5,16 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
 import type { Document } from "@/api/rag";
+import * as pdfjsLib from 'pdfjs-dist';
+
+// Configure PDF.js worker from CDN
+pdfjsLib.GlobalWorkerOptions.workerSrc = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.js`;
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+
+function getAuthToken(): string | null {
+  return localStorage.getItem("clarityql_auth_token");
+}
 
 interface DocumentViewerProps {
   documents: Document[];
@@ -50,7 +58,7 @@ export function DocumentViewer({ documents, selectedDocumentId, onClose }: Docum
         setDocumentBlobUrl(null);
       }
 
-      const token = localStorage.getItem("access_token");
+      const token = getAuthToken();
       const url = `${API_BASE_URL}/api/rag/documents/${currentDocument.id}/download`;
 
       try {
@@ -103,7 +111,7 @@ export function DocumentViewer({ documents, selectedDocumentId, onClose }: Docum
     );
   }
 
-  const token = localStorage.getItem("access_token");
+  const token = getAuthToken();
 
   // Prepare document for viewer - use blob URL if available
   const docs = documentBlobUrl ? [{

@@ -27,7 +27,7 @@ from packages.core.conversation import (
     merge_ast,
 )
 from packages.core.explainability import ExplainabilityBuilder
-from packages.core.safety.validator import ASTValidator
+from packages.core.safety.validator import ASTValidationError, ASTValidator
 from packages.core.schema_registry.registry import SchemaRegistry, get_default_registry
 from packages.core.sql_ast.compiler import SQLCompiler
 from packages.core.sql_ast.join_resolver import JoinPlan, JoinResolver
@@ -153,34 +153,43 @@ class NLQService:
                 merged = False
 
         # Step 5: Validate AST
-        validation_error = self._validator.validate(final_ast)
+        validation_error = self._validate_ast(final_ast)
         if validation_error:
             # Try fallback to parsed AST if merge caused issues
             if merged:
-                fallback_error = self._validator.validate(parsed_ast)
+                fallback_error = self._validate_ast(parsed_ast)
                 if fallback_error is None:
                     final_ast = parsed_ast
                     merged = False
+                    validation_error = None
                 else:
-                    return NLQResult(
-                        success=False,
-                        conversation_id=conversation.id,
-                        ast=final_ast,
-                        intent=intent,
-                        merged=merged,
-                        error=validation_error,
-                        error_type="validation_error",
-                    )
-            else:
-                return NLQResult(
-                    success=False,
-                    conversation_id=conversation.id,
-                    ast=final_ast,
-                    intent=intent,
-                    merged=merged,
-                    error=validation_error,
-                    error_type="validation_error",
-                )
+                    validation_error = fallback_error
+
+        # Retry parsing once with validation feedback if still invalid
+        if validation_error:
+            retry_ast = self._retry_parse_with_validation_feedback(
+                query=query,
+                validation_error=validation_error,
+            )
+            if retry_ast is not None:
+                retry_error = self._validate_ast(retry_ast)
+                if retry_error is None:
+                    final_ast = retry_ast
+                    merged = False
+                    validation_error = None
+                else:
+                    validation_error = retry_error
+
+        if validation_error:
+            return NLQResult(
+                success=False,
+                conversation_id=conversation.id,
+                ast=final_ast,
+                intent=intent,
+                merged=merged,
+                error=validation_error,
+                error_type="validation_error",
+            )
 
         # Step 6: Resolve joins
         try:
@@ -428,6 +437,39 @@ class NLQService:
             "products": products,
             "customers": customers,
         }
+
+    def _validate_ast(self, ast: QueryAST) -> str | None:
+        """Validate AST and return error string if invalid."""
+        try:
+            self._validator.validate(ast)
+        except ASTValidationError as e:
+            return str(e)
+        return None
+
+    def _retry_parse_with_validation_feedback(
+        self,
+        query: str,
+        validation_error: str,
+    ) -> QueryAST | None:
+        """
+        Retry parsing once with validation feedback for the LLM.
+
+        This nudges the model to correct semantic mistakes like
+        non-aggregatable metrics or unknown fields.
+        """
+        retry_prompt = (
+            f"{query}\n\n"
+            "The previous QueryAST failed validation:\n"
+            f"{validation_error}\n\n"
+            "Please correct the QueryAST. Use only valid fields from the schema. "
+            "Metrics must be aggregatable or derived, and date fields should "
+            "be used as dimensions for trends."
+        )
+
+        try:
+            return self._parser.parse(retry_prompt)
+        except Exception:
+            return None
 
 
 # Global service instance

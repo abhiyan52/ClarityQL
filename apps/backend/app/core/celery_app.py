@@ -51,6 +51,8 @@ celery_app.conf.task_routes = {
     "app.tasks.rag_tasks.generate_embeddings_task": {"queue": "rag_embeddings"},
     "app.tasks.rag_tasks.generate_embeddings_batch_task": {"queue": "rag_embeddings"},
     "app.tasks.rag_tasks.generate_embeddings_for_pending_documents_task": {"queue": "rag_embeddings"},
+    "app.tasks.rag_tasks.process_rag_query_task": {"queue": "rag_query"},
+    "app.tasks.nlq_tasks.process_nlq_query_task": {"queue": "nlq"},
 }
 
 

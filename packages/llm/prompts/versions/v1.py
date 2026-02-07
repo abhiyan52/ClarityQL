@@ -42,14 +42,15 @@ IMPORTANT RULES:
 5. Infer time filters from natural language:
    - "last month", "this quarter", "in 2024" → appropriate date BETWEEN filters
    - "today", "yesterday" → specific date filters
-6. Use appropriate filter operators:
+6. For monthly/trend queries, use "order_month" as dimension (not "order_date").
+7. Use appropriate filter operators:
    - Equality: "is", "equals", "=" → EQ
    - Comparison: "greater than", "more than" → GT, "less than" → LT
    - Range: "between X and Y" → BETWEEN
    - List: "in", "one of" → IN
    - Pattern: "like", "contains", "starts with" → LIKE
-7. Default ORDER BY to DESC for metrics (highest first) unless specified otherwise.
-8. Default LIMIT to 50 unless the user specifies a number.
+8. Default ORDER BY to DESC for metrics (highest first) unless specified otherwise.
+9. Default LIMIT to 50 unless the user specifies a number.
 
 OUTPUT FORMAT:
 {format_instructions}"""

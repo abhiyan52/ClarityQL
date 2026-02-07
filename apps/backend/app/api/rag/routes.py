@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, status, UploadFile, File, BackgroundTasks, Body
+from fastapi import APIRouter, HTTPException, status, UploadFile, File, Body
 from fastapi.responses import JSONResponse
 
 from app.core.dependencies import AsyncSessionDep, CurrentUser
@@ -172,151 +172,6 @@ async def query_documents(
 # ──────────────────────────────────────────────
 # Document Ingestion Endpoints
 # ──────────────────────────────────────────────
-
-
-# ──────────────────────────────────────────────
-# Request/Response Schemas
-# ──────────────────────────────────────────────
-
-
-class RAGQueryRequest(BaseModel):
-    """Request schema for RAG query."""
-
-    query: str = Field(..., min_length=1, max_length=5000, description="User query")
-    document_ids: list[str] | None = Field(
-        None, description="Optional list of document IDs to search (None = all)"
-    )
-    conversation_id: str | None = Field(
-        None, description="Optional conversation ID for context"
-    )
-    top_k: int = Field(5, ge=1, le=50, description="Number of results to return")
-    min_similarity: float = Field(
-        0.0, ge=0.0, le=1.0, description="Minimum similarity threshold"
-    )
-
-
-class ChunkResult(BaseModel):
-    """A single chunk result from RAG query."""
-
-    chunk_id: str
-    document_id: str
-    document_title: str
-    content: str
-    page_number: int | None
-    section: str | None
-    chunk_index: int
-    similarity_score: float
-    token_count: int | None
-
-
-class RAGQueryResponse(BaseModel):
-    """Response schema for RAG query."""
-
-    conversation_id: str
-    query: str
-    chunks: list[ChunkResult]
-    documents: list[dict]
-    total_chunks_found: int
-
-
-# ──────────────────────────────────────────────
-# RAG Query Endpoint
-# ──────────────────────────────────────────────
-
-
-@router.post("/query", response_model=RAGQueryResponse)
-async def query_documents(
-    request: RAGQueryRequest,
-    session: AsyncSessionDep,
-    current_user: CurrentUser,
-) -> RAGQueryResponse:
-    """
-    Query documents using semantic search.
-
-    Embeds the user's query and finds the most similar chunks from the specified
-    documents (or all documents if none specified).
-
-    Args:
-        request: Query request with query text, optional document IDs, etc.
-        session: Database session (injected)
-        current_user: Authenticated user (injected)
-
-    Returns:
-        RAGQueryResponse with matching chunks and metadata
-
-    Raises:
-        HTTPException 400: If document IDs are invalid
-        HTTPException 404: If conversation not found
-        HTTPException 403: If user doesn't own conversation
-        HTTPException 500: If query processing fails
-
-    Example:
-        ```bash
-        curl -X POST http://localhost:8000/api/rag/query \\
-          -H "Authorization: Bearer <token>" \\
-          -H "Content-Type: application/json" \\
-          -d '{
-            "query": "What are the key findings?",
-            "document_ids": ["uuid1", "uuid2"],
-            "top_k": 5
-          }'
-        ```
-    """
-    try:
-        # Parse document IDs if provided
-        document_ids = None
-        if request.document_ids:
-            try:
-                document_ids = [UUID(doc_id) for doc_id in request.document_ids]
-            except ValueError as e:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid document ID format: {str(e)}",
-                )
-
-        # Parse conversation ID if provided
-        conversation_id = None
-        if request.conversation_id:
-            try:
-                conversation_id = UUID(request.conversation_id)
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid conversation ID format",
-                )
-
-        # Execute query
-        rag_service = RAGQueryService(session)
-        result = await rag_service.query(
-            query=request.query,
-            tenant_id=current_user.tenant_id,
-            user_id=current_user.id,
-            document_ids=document_ids,
-            conversation_id=conversation_id,
-            top_k=request.top_k,
-            min_similarity=request.min_similarity,
-        )
-
-        return RAGQueryResponse(**result)
-
-    except PermissionError as e:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=str(e),
-        )
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=str(e),
-        )
-    except Exception as e:
-        logger.error(f"RAG query failed: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Query processing failed: {str(e)}",
-        )
-
-
 # ──────────────────────────────────────────────
 # Document Ingestion Endpoints
 # ──────────────────────────────────────────────
@@ -399,6 +254,34 @@ async def ingest_document_async(
                 detail=f"Failed to save file: {str(e)}",
             )
 
+        # Check for duplicate document by checksum
+        import hashlib
+        from app.models.document import Document as DocumentModel
+        
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            for chunk_data in iter(lambda: f.read(4096), b""):
+                sha256.update(chunk_data)
+        checksum = sha256.hexdigest()
+        
+        # Check if document already exists
+        from sqlalchemy import select
+        result = await session.execute(
+            select(DocumentModel).where(
+                DocumentModel.tenant_id == current_user.tenant_id,
+                DocumentModel.checksum == checksum,
+            )
+        )
+        existing_doc = result.scalar_one_or_none()
+        
+        if existing_doc:
+            logger.info(
+                f"Duplicate document detected (checksum={checksum}), will reprocess: {existing_doc.id}"
+            )
+            message = f"Document already exists. Reprocessing with new settings."
+        else:
+            message = "Document upload successful. Processing in background."
+
         # Create task record in database first (before queueing Celery task)
         # This prevents race conditions where the worker starts before the DB commit
         task = Task(
@@ -418,6 +301,9 @@ async def ingest_document_async(
         session.add(task)
         await session.flush()  # Get task.id
         await session.refresh(task)
+
+        # Use Task ID as Celery task ID to avoid races updating celery_task_id
+        task.celery_task_id = str(task.id)
         
         # ⚠️ EXCEPTIONAL CASE: Commit before queuing Celery task
         # Normally we let the session dependency handle commits, but here we MUST
@@ -429,24 +315,20 @@ async def ingest_document_async(
         #    for background task coordination
         await session.commit()
 
-        # Queue Celery task with task.id so worker can find the record immediately
-        celery_task = ingest_document_task.delay(
-            task_id=str(task.id),  # Our Task model ID
-            file_path=str(file_path),
-            document_title=document_title,
-            description=description,
-            language=language,
-            tenant_id=str(current_user.tenant_id),
-            owner_user_id=str(current_user.id),
-            max_chunk_tokens=max_chunk_tokens,
-            chunk_overlap_tokens=chunk_overlap_tokens,
+        # Queue Celery task with Task ID as Celery task ID
+        celery_task = ingest_document_task.apply_async(
+            kwargs={
+                "file_path": str(file_path),
+                "document_title": document_title,
+                "description": description,
+                "language": language,
+                "tenant_id": str(current_user.tenant_id),
+                "owner_user_id": str(current_user.id),
+                "max_chunk_tokens": max_chunk_tokens,
+                "chunk_overlap_tokens": chunk_overlap_tokens,
+            },
+            task_id=str(task.id),
         )
-
-        # Update task with Celery task ID for reference
-        # Re-attach to session after commit and update celery_task_id
-        task.celery_task_id = celery_task.id
-        session.add(task)  # Re-add to session
-        await session.commit()  # Commit to persist celery_task_id
 
         logger.info(
             f"Ingestion task queued: {task.id} (Celery: {celery_task.id})"
@@ -458,7 +340,9 @@ async def ingest_document_async(
                 "task_id": str(task.id),
                 "celery_task_id": celery_task.id,
                 "status": task.status.value,
-                "message": "Document upload successful. Processing in background.",
+                "message": message,
+                "is_reprocessing": existing_doc is not None,
+                "existing_document_id": str(existing_doc.id) if existing_doc else None,
                 "status_url": f"/api/rag/tasks/{task.id}",
             },
         )

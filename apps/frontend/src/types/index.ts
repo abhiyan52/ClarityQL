@@ -69,6 +69,9 @@ export interface ChatMessage {
   timestamp: Date;
   response?: NLQResponse;
   isLoading?: boolean;
+  progressPercentage?: number;
+  progressMessage?: string;
+  taskId?: string;
 }
 
 export interface Conversation {

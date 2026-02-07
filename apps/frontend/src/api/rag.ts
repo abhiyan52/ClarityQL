@@ -4,6 +4,10 @@
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
+function getAuthToken(): string | null {
+  return localStorage.getItem("clarityql_auth_token");
+}
+
 export interface Document {
   id: string;
   title: string;
@@ -26,6 +30,8 @@ export interface UploadResponse {
   status: string;
   message: string;
   status_url: string;
+  is_reprocessing?: boolean;
+  existing_document_id?: string;
 }
 
 export interface TaskStatus {
@@ -64,7 +70,7 @@ export async function uploadDocument(
     chunk_overlap_tokens?: number;
   }
 ): Promise<UploadResponse> {
-  const token = localStorage.getItem("access_token");
+  const token = getAuthToken();
   if (!token) {
     throw new Error("Not authenticated");
   }
@@ -108,7 +114,7 @@ export async function uploadDocument(
  * Get task status for document processing
  */
 export async function getTaskStatus(taskId: string): Promise<TaskStatus> {
-  const token = localStorage.getItem("access_token");
+  const token = getAuthToken();
   if (!token) {
     throw new Error("Not authenticated");
   }
@@ -134,7 +140,7 @@ export async function listDocuments(
   page: number = 1,
   pageSize: number = 20
 ): Promise<DocumentsResponse> {
-  const token = localStorage.getItem("access_token");
+  const token = getAuthToken();
   if (!token) {
     throw new Error("Not authenticated");
   }
@@ -160,7 +166,7 @@ export async function listDocuments(
  * Get a specific document with full details
  */
 export async function getDocument(documentId: string): Promise<Document> {
-  const token = localStorage.getItem("access_token");
+  const token = getAuthToken();
   if (!token) {
     throw new Error("Not authenticated");
   }
@@ -222,7 +228,7 @@ export interface RAGQueryRequest {
 export async function queryDocuments(
   request: RAGQueryRequest
 ): Promise<RAGQueryResponse> {
-  const token = localStorage.getItem("access_token");
+  const token = getAuthToken();
   if (!token) {
     throw new Error("Not authenticated");
   }

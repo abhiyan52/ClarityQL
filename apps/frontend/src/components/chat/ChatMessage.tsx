@@ -1,8 +1,11 @@
-import { Bot, User } from "lucide-react";
+import { Bot, User, X } from "lucide-react";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
+import { Button } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 import type { ChatMessage as ChatMessageType } from "@/types";
 import { ResultsPanel } from "@/components/results/ResultsPanel";
+import { useChatStore } from "@/store/chat";
 
 interface ChatMessageProps {
   message: ChatMessageType;
@@ -11,6 +14,7 @@ interface ChatMessageProps {
 export function ChatMessage({ message }: ChatMessageProps) {
   const isUser = message.role === "user";
   const isLoading = message.isLoading;
+  const { cancelCurrentQuery } = useChatStore();
 
   // Convert timestamp to Date if it's a string (from localStorage)
   const timestamp = typeof message.timestamp === 'string' 
@@ -57,7 +61,10 @@ export function ChatMessage({ message }: ChatMessageProps) {
         </div>
 
         {isLoading ? (
-          <LoadingIndicator />
+          <LoadingIndicator 
+            message={message} 
+            onCancel={cancelCurrentQuery}
+          />
         ) : (
           <>
             <p className="text-sm leading-relaxed">{message.content}</p>
@@ -69,12 +76,45 @@ export function ChatMessage({ message }: ChatMessageProps) {
   );
 }
 
-function LoadingIndicator() {
+function LoadingIndicator({ 
+  message, 
+  onCancel 
+}: { 
+  message: ChatMessageType;
+  onCancel: () => void;
+}) {
+  const hasProgress = typeof message.progressPercentage === 'number';
+
   return (
-    <div className="flex items-center gap-1">
-      <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
-      <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
-      <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+    <div className="space-y-2">
+      {hasProgress ? (
+        <>
+          <div className="flex items-center justify-between">
+            <p className="text-sm text-muted-foreground">
+              {message.progressMessage || "Processing..."}
+            </p>
+            <span className="text-xs text-muted-foreground">
+              {Math.round(message.progressPercentage || 0)}%
+            </span>
+          </div>
+          <Progress value={message.progressPercentage} className="h-1" />
+        </>
+      ) : (
+        <div className="flex items-center gap-1">
+          <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+          <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+          <div className="typing-dot h-2 w-2 rounded-full bg-muted-foreground" />
+        </div>
+      )}
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onCancel}
+        className="mt-2"
+      >
+        <X className="mr-1 h-3 w-3" />
+        Cancel
+      </Button>
     </div>
   );
 }

@@ -4,7 +4,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { ChatMessage } from "./ChatMessage";
 import { ChatInput } from "./ChatInput";
 import { useChatStore } from "@/store/chat";
-import { sendQuery } from "@/api/nlq";
+import { submitQuery, streamTaskProgress, cancelTask } from "@/api/nlq";
 
 export function ChatWindow() {
   const {
@@ -15,6 +15,7 @@ export function ChatWindow() {
     addMessage,
     updateMessage,
     setLoading,
+    setAbortController,
     getMessages,
   } = useChatStore();
 
@@ -48,6 +49,8 @@ export function ChatWindow() {
       role: "assistant",
       content: "",
       isLoading: true,
+      progressPercentage: 0,
+      progressMessage: "Starting query processing...",
     });
 
     setLoading(true);
@@ -59,16 +62,60 @@ export function ChatWindow() {
         .pop();
       const backendConversationId = lastAssistantMessage?.response?.conversation_id;
 
-      const response = await sendQuery({
+      // Step 1: Submit query for background processing
+      const { task_id } = await submitQuery({
         query: content,
         conversation_id: backendConversationId,
       });
 
+      // Update message with task ID
       updateMessage(assistantId, {
-        content: "Here are your results:",
-        response,
-        isLoading: false,
+        taskId: task_id,
       });
+
+      // Step 2: Stream progress via SSE
+      const controller = streamTaskProgress(task_id, {
+        onProgress: (data) => {
+          updateMessage(assistantId, {
+            progressPercentage: data.percentage,
+            progressMessage: data.message,
+          });
+        },
+        onComplete: (response) => {
+          updateMessage(assistantId, {
+            content: "Here are your results:",
+            response,
+            isLoading: false,
+            progressPercentage: undefined,
+            progressMessage: undefined,
+          });
+          setLoading(false);
+          setAbortController(null);
+        },
+        onError: (error) => {
+          updateMessage(assistantId, {
+            content: `Sorry, I couldn't process your request. ${error}`,
+            isLoading: false,
+            progressPercentage: undefined,
+            progressMessage: undefined,
+          });
+          setLoading(false);
+          setAbortController(null);
+        },
+        onCancelled: () => {
+          updateMessage(assistantId, {
+            content: "Query was cancelled.",
+            isLoading: false,
+            progressPercentage: undefined,
+            progressMessage: undefined,
+          });
+          setLoading(false);
+          setAbortController(null);
+        },
+      });
+
+      // Store controller so cancel button can use it
+      setAbortController(controller);
     } catch (error) {
       let errorMessage = "Please try again.";
       if (error instanceof Error) {
@@ -81,9 +128,11 @@ export function ChatWindow() {
       updateMessage(assistantId, {
         content: `Sorry, I couldn't process your request. ${errorMessage}`,
         isLoading: false,
+        progressPercentage: undefined,
+        progressMessage: undefined,
       });
-    } finally {
       setLoading(false);
+      setAbortController(null);
     }
   };
 

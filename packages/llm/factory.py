@@ -47,6 +47,7 @@ class LLMFactory:
         model: str | None = None,
         temperature: float = 0.0,
         api_key: str | None = None,
+        request_timeout_seconds: float | None = None,
         **kwargs,
     ) -> BaseChatModel:
         """
@@ -73,11 +74,29 @@ class LLMFactory:
 
         match provider:
             case "gemini":
-                return cls._create_gemini(model, temperature, api_key, **kwargs)
+                return cls._create_gemini(
+                    model,
+                    temperature,
+                    api_key,
+                    request_timeout_seconds,
+                    **kwargs,
+                )
             case "openai":
-                return cls._create_openai(model, temperature, api_key, **kwargs)
+                return cls._create_openai(
+                    model,
+                    temperature,
+                    api_key,
+                    request_timeout_seconds,
+                    **kwargs,
+                )
             case "anthropic":
-                return cls._create_anthropic(model, temperature, api_key, **kwargs)
+                return cls._create_anthropic(
+                    model,
+                    temperature,
+                    api_key,
+                    request_timeout_seconds,
+                    **kwargs,
+                )
             case _:
                 raise LLMProviderError(
                     f"Unknown provider: {provider}. "
@@ -104,6 +123,7 @@ class LLMFactory:
             model=settings.llm_model,
             temperature=settings.llm_temperature,
             api_key=settings.get_api_key(),
+            request_timeout_seconds=settings.llm_request_timeout_seconds,
         )
 
     # -------------------------
@@ -115,6 +135,7 @@ class LLMFactory:
         model: str,
         temperature: float,
         api_key: str | None,
+        request_timeout_seconds: float | None,
         **kwargs,
     ) -> BaseChatModel:
         """Create a Gemini (Google Generative AI) instance."""
@@ -134,6 +155,8 @@ class LLMFactory:
 
         if api_key:
             init_kwargs["google_api_key"] = api_key
+        if request_timeout_seconds is not None:
+            init_kwargs["request_timeout"] = request_timeout_seconds
 
         return ChatGoogleGenerativeAI(**init_kwargs)
 
@@ -142,6 +165,7 @@ class LLMFactory:
         model: str,
         temperature: float,
         api_key: str | None,
+        request_timeout_seconds: float | None,
         **kwargs,
     ) -> BaseChatModel:
         """Create an OpenAI instance."""
@@ -161,6 +185,8 @@ class LLMFactory:
 
         if api_key:
             init_kwargs["api_key"] = api_key
+        if request_timeout_seconds is not None:
+            init_kwargs["request_timeout"] = request_timeout_seconds
 
         return ChatOpenAI(**init_kwargs)
 
@@ -169,6 +195,7 @@ class LLMFactory:
         model: str,
         temperature: float,
         api_key: str | None,
+        request_timeout_seconds: float | None,
         **kwargs,
     ) -> BaseChatModel:
         """Create an Anthropic instance."""
@@ -188,5 +215,7 @@ class LLMFactory:
 
         if api_key:
             init_kwargs["api_key"] = api_key
+        if request_timeout_seconds is not None:
+            init_kwargs["timeout"] = request_timeout_seconds
 
         return ChatAnthropic(**init_kwargs)

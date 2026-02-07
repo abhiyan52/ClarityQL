@@ -34,6 +34,12 @@ export function DocumentsPage() {
       // Track the upload task
       const file = variables as File;
       setUploadingFiles(prev => new Map(prev).set(data.task_id, { taskId: data.task_id, fileName: file.name }));
+      
+      // Show notification if reprocessing
+      if (data.is_reprocessing) {
+        console.log(`📝 Document already exists. Reprocessing: ${file.name}`);
+      }
+      
       // Refetch documents
       queryClient.invalidateQueries({ queryKey: ["documents"] });
     },

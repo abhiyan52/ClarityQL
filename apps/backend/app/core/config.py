@@ -69,6 +69,11 @@ class LLMSettings(BaseSettings):
         le=2.0,
         description="Temperature for LLM responses",
     )
+    llm_request_timeout_seconds: float | None = Field(
+        default=60.0,
+        ge=1.0,
+        description="Timeout in seconds for LLM requests",
+    )
 
     # Provider API keys
     google_api_key: str | None = Field(

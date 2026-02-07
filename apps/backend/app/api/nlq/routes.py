@@ -133,51 +133,54 @@ async def stream_task_status(
 
     async def event_generator():
         """Generate SSE events from task status."""
-        last_status = None
+        from app.db.session import async_session_factory
+        
         last_progress = None
 
         while True:
-            # Refresh task from DB
-            await session.refresh(task)
+            # IMPORTANT: create a fresh session each poll so we see
+            # the latest data committed by the Celery worker.
+            async with async_session_factory() as poll_session:
+                result = await poll_session.execute(
+                    select(Task).where(Task.id == task_id)
+                )
+                current_task = result.scalar_one_or_none()
+                
+                if not current_task:
+                    data = {"error": "Task not found", "error_type": "task_deleted"}
+                    yield f"event: error\ndata: {json.dumps(data)}\n\n"
+                    return
 
-            # Send progress event if status/progress changed
-            if task.status == TaskStatus.PROGRESS:
-                current_progress = (task.progress_current, task.progress_message)
-                if current_progress != last_progress:
+                task_status = current_task.status
+
+                if task_status == TaskStatus.PROGRESS:
+                    current_progress = (current_task.progress_current, current_task.progress_message)
+                    if current_progress != last_progress:
+                        data = {
+                            "percentage": current_task.progress_percentage,
+                            "message": current_task.progress_message or "",
+                            "current": current_task.progress_current,
+                            "total": current_task.progress_total,
+                        }
+                        yield f"event: progress\ndata: {json.dumps(data)}\n\n"
+                        last_progress = current_progress
+
+                elif task_status == TaskStatus.SUCCESS:
+                    yield f"event: complete\ndata: {json.dumps(current_task.result)}\n\n"
+                    return
+
+                elif task_status == TaskStatus.FAILURE:
                     data = {
-                        "percentage": task.progress_percentage,
-                        "message": task.progress_message or "",
-                        "current": task.progress_current,
-                        "total": task.progress_total,
-                    }
-                    yield f"event: progress\ndata: {json.dumps(data)}\n\n"
-                    last_progress = current_progress
-
-            # Send complete event
-            elif task.status == TaskStatus.SUCCESS:
-                if last_status != TaskStatus.SUCCESS:
-                    yield f"event: complete\ndata: {json.dumps(task.result)}\n\n"
-                    last_status = TaskStatus.SUCCESS
-                return
-
-            # Send error event
-            elif task.status == TaskStatus.FAILURE:
-                if last_status != TaskStatus.FAILURE:
-                    data = {
-                        "error": task.error_message or "Unknown error",
+                        "error": current_task.error_message or "Unknown error",
                         "error_type": "task_failure",
                     }
                     yield f"event: error\ndata: {json.dumps(data)}\n\n"
-                    last_status = TaskStatus.FAILURE
-                return
+                    return
 
-            # Send cancelled event
-            elif task.status == TaskStatus.REVOKED:
-                if last_status != TaskStatus.REVOKED:
+                elif task_status == TaskStatus.REVOKED:
                     data = {"message": "Task was cancelled"}
                     yield f"event: cancelled\ndata: {json.dumps(data)}\n\n"
-                    last_status = TaskStatus.REVOKED
-                return
+                    return
 
             # Wait before next poll
             await asyncio.sleep(1)

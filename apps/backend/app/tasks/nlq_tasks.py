@@ -1,8 +1,10 @@
 """Celery tasks for NLQ query processing."""
 
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from uuid import UUID
 
 from celery import Task as CeleryTask
@@ -99,6 +101,15 @@ class CallbackTask(CeleryTask):
             else:
                 logger.error(f"Task {task_id} not found in database (update_progress)")
 
+    def check_revoked(self, task_id: str) -> bool:
+        """Check if the task has been revoked (cancelled by user)."""
+        with SessionLocal() as session:
+            task = session.query(Task).filter(Task.id == UUID(task_id)).first()
+            if task and task.status == TaskStatus.REVOKED:
+                logger.info(f"Task {task_id} was revoked by user")
+                return True
+        return False
+
 
 def _create_default_tables():
     """Create default SQLAlchemy tables for the compiler."""
@@ -188,8 +199,7 @@ def process_nlq_query_task(
     compiler = SQLCompiler(sqlalchemy_tables=tables, registry=registry)
 
     # Check for revocation
-    if self.is_aborted():
-        logger.info(f"Task {task_id} was revoked")
+    if self.check_revoked(task_id):
         return {}
 
     with SessionLocal() as session:
@@ -224,9 +234,7 @@ def process_nlq_query_task(
             session.flush()
             conversation_id = str(conversation.id)
 
-        # Check for revocation
-        if self.is_aborted():
-            logger.info(f"Task {task_id} was revoked")
+        if self.check_revoked(task_id):
             return {}
 
         # Step 2: Intent classification and parsing (parallel if previous_ast exists)
@@ -251,9 +259,7 @@ def process_nlq_query_task(
             self.update_progress(task_id, 30, 100, "Parsing query with AI...")
             parsed_ast = parser.parse(query)
 
-        # Check for revocation
-        if self.is_aborted():
-            logger.info(f"Task {task_id} was revoked")
+        if self.check_revoked(task_id):
             return {}
 
         # Step 3: Merge if REFINE
@@ -292,9 +298,7 @@ def process_nlq_query_task(
         if validation_error:
             self.update_progress(task_id, 60, 100, "Retrying with validation feedback...")
             
-            # Check for revocation
-            if self.is_aborted():
-                logger.info(f"Task {task_id} was revoked")
+            if self.check_revoked(task_id):
                 return {}
             
             retry_prompt = (
@@ -318,9 +322,7 @@ def process_nlq_query_task(
         if validation_error:
             raise Exception(f"Validation error: {validation_error}")
 
-        # Check for revocation
-        if self.is_aborted():
-            logger.info(f"Task {task_id} was revoked")
+        if self.check_revoked(task_id):
             return {}
 
         # Step 6: Resolve joins
@@ -340,7 +342,20 @@ def process_nlq_query_task(
         from sqlalchemy import text
         result = session.execute(text(sql_string))
         columns = list(result.keys())
-        rows = [list(row) for row in result.fetchall()]
+        
+        def _serialize_value(val):
+            """Make values JSON-serializable."""
+            if val is None:
+                return None
+            if isinstance(val, Decimal):
+                return float(val)
+            if isinstance(val, (datetime, date)):
+                return val.isoformat()
+            if isinstance(val, UUID):
+                return str(val)
+            return val
+        
+        rows = [[_serialize_value(v) for v in row] for row in result.fetchall()]
 
         # Step 9: Build explainability
         explanation = explainability.build(final_ast, join_plan)

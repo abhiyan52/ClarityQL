@@ -53,6 +53,7 @@ class FieldMeta:
     description: str = ""  # human-readable description for LLM context
     aggregatable: bool = False  # can this field be used in SUM/AVG/etc?
     allowed_values: tuple[str, ...] | None = None  # for categorical fields
+    date_trunc: str | None = None  # when grouping: "month", "quarter", "year" (PostgreSQL)
 
 
 @dataclass(frozen=True)
@@ -208,6 +209,13 @@ _DEFAULT_TABLES: dict[str, TableMeta] = {
                 column="order_date",
                 field_type=FieldType.DATE,
                 description="Date when the order was placed",
+            ),
+            "order_month": FieldMeta(
+                table="orders",
+                column="order_date",
+                field_type=FieldType.DATE,
+                description="Month of the order (use for monthly trends)",
+                date_trunc="month",
             ),
             "quantity": FieldMeta(
                 table="orders",

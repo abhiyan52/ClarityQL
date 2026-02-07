@@ -203,6 +203,7 @@ export interface ChunkResult {
 export interface RAGQueryResponse {
   conversation_id: string;
   query: string;
+  answer: string;
   chunks: ChunkResult[];
   documents: Array<{
     document_id: string;
@@ -222,8 +223,185 @@ export interface RAGQueryRequest {
   min_similarity?: number;
 }
 
+export interface ProgressData {
+  percentage: number;
+  message: string;
+  current: number;
+  total: number;
+}
+
+export interface RAGStreamCallbacks {
+  onProgress: (data: ProgressData) => void;
+  onComplete: (response: RAGQueryResponse) => void;
+  onError: (error: string) => void;
+  onCancelled?: () => void;
+}
+
 /**
- * Query documents using semantic search
+ * Submit a RAG query for background processing.
+ * Returns a task_id that can be used to stream progress.
+ */
+export async function submitQuery(request: RAGQueryRequest): Promise<{ task_id: string }> {
+  const token = getAuthToken();
+  if (!token) {
+    throw new Error("Not authenticated");
+  }
+
+  const response = await fetch(`${API_BASE_URL}/api/rag/query`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Unknown error" }));
+    let message = `HTTP ${response.status}`;
+    if (error.detail) {
+      if (typeof error.detail === "string") {
+        message = error.detail;
+      } else if (typeof error.detail === "object") {
+        message = JSON.stringify(error.detail);
+      }
+    }
+    throw new Error(message);
+  }
+
+  return response.json();
+}
+
+/**
+ * Stream task progress via SSE using fetch + ReadableStream.
+ * EventSource doesn't support custom headers, so we use fetch instead.
+ * 
+ * Returns an AbortController that can be used to cancel the stream.
+ */
+export function streamTaskProgress(
+  taskId: string,
+  callbacks: RAGStreamCallbacks
+): AbortController {
+  const controller = new AbortController();
+  
+  const connect = async () => {
+    try {
+      const token = getAuthToken();
+      const headers: HeadersInit = {};
+      if (token) {
+        headers.Authorization = `Bearer ${token}`;
+      }
+
+      const response = await fetch(
+        `${API_BASE_URL}/api/rag/tasks/${taskId}/stream`,
+        {
+          headers,
+          signal: controller.signal,
+        }
+      );
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+
+      if (!reader) {
+        throw new Error("Response body is null");
+      }
+
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        
+        // Process complete SSE messages (terminated by \n\n)
+        const messages = buffer.split("\n\n");
+        buffer = messages.pop() || "";
+
+        for (const message of messages) {
+          if (!message.trim()) continue;
+
+          const lines = message.split("\n");
+          let eventType = "message";
+          let data = "";
+
+          for (const line of lines) {
+            if (line.startsWith("event:")) {
+              eventType = line.substring(6).trim();
+            } else if (line.startsWith("data:")) {
+              data = line.substring(5).trim();
+            }
+          }
+
+          if (!data) continue;
+
+          try {
+            const parsed = JSON.parse(data);
+
+            switch (eventType) {
+              case "progress":
+                callbacks.onProgress(parsed);
+                break;
+              case "complete":
+                callbacks.onComplete(parsed);
+                break;
+              case "error":
+                callbacks.onError(parsed.error || "Unknown error");
+                break;
+              case "cancelled":
+                callbacks.onCancelled?.();
+                break;
+            }
+          } catch (e) {
+            console.error("Failed to parse SSE data:", e);
+          }
+        }
+      }
+    } catch (error: any) {
+      if (error.name === "AbortError") {
+        // User cancelled
+        return;
+      }
+      callbacks.onError(error.message || "Stream connection failed");
+    }
+  };
+
+  connect();
+
+  return controller;
+}
+
+/**
+ * Cancel a running RAG task.
+ */
+export async function cancelTask(taskId: string): Promise<void> {
+  const token = getAuthToken();
+  if (!token) {
+    throw new Error("Not authenticated");
+  }
+
+  const response = await fetch(`${API_BASE_URL}/api/rag/tasks/${taskId}/cancel`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.detail || "Failed to cancel task");
+  }
+}
+
+/**
+ * @deprecated Use submitQuery and streamTaskProgress instead
+ * Query documents using semantic search (synchronous - kept for backward compatibility)
  */
 export async function queryDocuments(
   request: RAGQueryRequest

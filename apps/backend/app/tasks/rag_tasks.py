@@ -14,8 +14,10 @@ from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.models.task import Task, TaskStatus, TaskType
 from app.schemas.rag import IngestionRequest
+from app.services.rag.answer_generator import RAGAnswerGenerator
 from app.services.rag.document_loader import DocumentLoadError
 from app.services.rag.pipeline import IngestionPipeline
+from app.services.rag.query_service import RAGQueryServiceSync
 
 logger = logging.getLogger(__name__)
 settings = get_settings()
@@ -112,6 +114,15 @@ class CallbackTask(CeleryTask):
                 session.commit()
             else:
                 logger.error(f"Task {task_id} not found in database (update_progress)")
+
+    def check_revoked(self, task_id: str) -> bool:
+        """Check if the task has been revoked (cancelled by user)."""
+        with SessionLocal() as session:
+            task = session.query(Task).filter(Task.id == UUID(task_id)).first()
+            if task and task.status == TaskStatus.REVOKED:
+                logger.info(f"Task {task_id} was revoked by user")
+                return True
+        return False
 
 
 @celery_app.task(
@@ -669,4 +680,113 @@ def generate_embeddings_for_pending_documents_task(self) -> dict:
         logger.error(
             f"Failed to process pending documents: {e}", exc_info=True
         )
+        raise
+
+
+@celery_app.task(
+    bind=True,
+    base=CallbackTask,
+    name="app.tasks.rag_tasks.process_rag_query_task",
+    soft_time_limit=120,
+    time_limit=150,
+    max_retries=0,
+)
+def process_rag_query_task(
+    self,
+    task_id: str,
+    query: str,
+    user_id: str,
+    tenant_id: str,
+    document_ids: list[str] | None = None,
+    conversation_id: str | None = None,
+    top_k: int = 5,
+    min_similarity: float = 0.0,
+) -> dict:
+    """
+    Process a RAG query in the background with progress updates.
+    
+    Args:
+        task_id: Task UUID for progress tracking.
+        query: User's natural language query.
+        user_id: User UUID.
+        tenant_id: Tenant UUID.
+        document_ids: Optional list of document UUIDs to search within.
+        conversation_id: Optional conversation UUID for context.
+        top_k: Number of top results to return.
+        min_similarity: Minimum similarity threshold 0-1.
+    
+    Returns:
+        Dict containing RAGQueryResponse data with answer.
+    """
+    logger.info(f"Starting RAG query task {task_id} for user {user_id}")
+
+    # Check for revocation
+    if self.check_revoked(task_id):
+        return {}
+
+    try:
+        # Step 1: Retrieve chunks
+        self.update_progress(task_id, 10, 100, "Searching documents...")
+        
+        # Convert document_ids to UUIDs if provided
+        document_uuids = None
+        if document_ids:
+            document_uuids = [UUID(doc_id) for doc_id in document_ids]
+        
+        conversation_uuid = None
+        if conversation_id:
+            conversation_uuid = UUID(conversation_id)
+
+        # Use sync RAG query (async SQLAlchemy/asyncpg conflicts with Celery event loop)
+        with SessionLocal() as session:
+            rag_service = RAGQueryServiceSync(session)
+            rag_result = rag_service.query(
+                query=query,
+                tenant_id=UUID(tenant_id),
+                user_id=UUID(user_id),
+                document_ids=document_uuids,
+                conversation_id=conversation_uuid,
+                top_k=top_k,
+                min_similarity=min_similarity,
+            )
+            session.commit()
+
+        if self.check_revoked(task_id):
+            return {}
+
+        # Step 2: Generate answer with LLM
+        self.update_progress(task_id, 60, 100, "Generating answer...")
+        
+        answer_generator = RAGAnswerGenerator()
+        
+        # Generate answer from chunks
+        answer = answer_generator.generate(
+            query=query,
+            chunks=rag_result.get("chunks", []),
+            conversation_history=None,  # TODO: Load conversation history if needed
+        )
+
+        if self.check_revoked(task_id):
+            return {}
+
+        # Step 3: Format response
+        self.update_progress(task_id, 80, 100, "Finalizing response...")
+
+        result_dict = {
+            "conversation_id": rag_result["conversation_id"],
+            "query": query,
+            "answer": answer,
+            "chunks": rag_result["chunks"],
+            "documents": rag_result["documents"],
+            "total_chunks_found": rag_result["total_chunks_found"],
+        }
+
+        self.update_progress(task_id, 100, 100, "Complete!")
+        
+        logger.info(f"RAG query task {task_id} completed successfully")
+        return result_dict
+
+    except Exception as e:
+        logger.error(f"RAG query task {task_id} failed: {e}", exc_info=True)
+        # Error will be handled by CallbackTask.on_failure
         raise

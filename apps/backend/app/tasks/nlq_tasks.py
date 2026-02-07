@@ -306,8 +306,8 @@ def process_nlq_query_task(
                 "The previous QueryAST failed validation:\n"
                 f"{validation_error}\n\n"
                 "Please correct the QueryAST. Use only valid fields from the schema. "
-                "Metrics must be aggregatable or derived, and date fields should "
-                "be used as dimensions for trends."
+                "Metrics must be aggregatable or derived. For monthly/trend queries, "
+                "use order_month as dimension (not order_date)."
             )
             
             try:

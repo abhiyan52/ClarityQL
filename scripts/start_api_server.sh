@@ -16,7 +16,10 @@ export PYTHONPATH="${PYTHONPATH}:$(pwd)/../.."
 # Load environment variables
 if [ -f "../../.env" ]; then
     echo "Loading environment variables from .env"
-    export $(cat ../../.env | grep -v '^#' | xargs)
+    # Use set -a to export all variables from .env
+    set -a
+    source ../../.env
+    set +a
 fi
 
 echo ""

@@ -6,6 +6,7 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.models.chunk import Chunk
 from app.models.conversation import Conversation
@@ -257,3 +258,185 @@ class RAGQueryService:
             self.session.add(state)
 
         await self.session.flush()
+
+
+class RAGQueryServiceSync:
+    """
+    Synchronous RAG query service for use in Celery tasks.
+
+    Uses sync SQLAlchemy engine (psycopg) instead of async (asyncpg) to avoid
+    event loop conflicts when running inside Celery workers.
+    """
+
+    def __init__(self, session: Session):
+        self.session = session
+        self.embedding_service = get_embedding_service()
+
+    def query(
+        self,
+        query: str,
+        tenant_id: UUID,
+        user_id: UUID,
+        document_ids: List[UUID] | None = None,
+        conversation_id: UUID | None = None,
+        top_k: int = 5,
+        min_similarity: float = 0.0,
+    ) -> dict:
+        """
+        Execute a RAG query: embed query, find similar chunks, return results.
+
+        Args:
+            query: User's natural language query
+            tenant_id: Tenant ID for multi-tenancy filtering
+            user_id: User ID for conversation ownership
+            document_ids: Optional list of document IDs to search within (None = all)
+            conversation_id: Optional conversation ID for context continuity
+            top_k: Number of top results to return (default: 5)
+            min_similarity: Minimum similarity threshold 0-1 (default: 0.0)
+
+        Returns:
+            dict with:
+                - conversation_id: UUID of conversation
+                - query: Original query text
+                - chunks: List of matching chunks with scores
+                - documents: Document metadata for matched chunks
+        """
+        logger.info(
+            f"RAG query (sync): '{query[:50]}...' for tenant {tenant_id}, "
+            f"docs={document_ids}, top_k={top_k}"
+        )
+
+        # 1. Get or create conversation
+        conversation = self._get_or_create_conversation(
+            conversation_id=conversation_id,
+            user_id=user_id,
+        )
+
+        # 2. Generate query embedding
+        query_embedding = self.embedding_service.encode(query)
+        embedding_list = query_embedding.tolist()
+
+        # 3. Build similarity search query
+        query_obj = self._build_similarity_query(
+            embedding=embedding_list,
+            tenant_id=tenant_id,
+            document_ids=document_ids,
+            top_k=top_k,
+        )
+
+        # 4. Execute search (sync)
+        result = self.session.execute(query_obj)
+        chunks_with_scores = result.all()
+
+        # 5. Filter by minimum similarity if specified
+        if min_similarity > 0.0:
+            chunks_with_scores = [
+                (chunk, score)
+                for chunk, score in chunks_with_scores
+                if (1 - score) >= min_similarity  # cosine distance to similarity
+            ]
+
+        # 6. Get document metadata for matched chunks
+        document_map = self._get_documents_for_chunks(
+            [chunk.document_id for chunk, _ in chunks_with_scores]
+        )
+
+        # 7. Format response
+        formatted_chunks = [
+            {
+                "chunk_id": str(chunk.id),
+                "document_id": str(chunk.document_id),
+                "document_title": document_map.get(chunk.document_id, {}).get(
+                    "title", "Unknown"
+                ),
+                "content": chunk.content,
+                "page_number": chunk.page_number,
+                "section": chunk.section,
+                "chunk_index": chunk.chunk_index,
+                "similarity_score": 1 - score,  # Convert distance to similarity
+                "token_count": chunk.token_count,
+            }
+            for chunk, score in chunks_with_scores
+        ]
+
+        return {
+            "conversation_id": str(conversation.id),
+            "query": query,
+            "chunks": formatted_chunks,
+            "documents": list(document_map.values()),
+            "total_chunks_found": len(formatted_chunks),
+        }
+
+    def _build_similarity_query(
+        self,
+        embedding: List[float],
+        tenant_id: UUID,
+        document_ids: List[UUID] | None,
+        top_k: int,
+    ):
+        """Build a pgvector similarity search query."""
+        query = (
+            select(
+                Chunk,
+                Chunk.embedding.cosine_distance(embedding).label("distance"),
+            )
+            .where(
+                Chunk.tenant_id == tenant_id,
+                Chunk.embedding.isnot(None),
+            )
+        )
+        if document_ids:
+            query = query.where(Chunk.document_id.in_(document_ids))
+        query = query.order_by("distance").limit(top_k)
+        return query
+
+    def _get_documents_for_chunks(
+        self, document_ids: List[UUID]
+    ) -> dict[UUID, dict]:
+        """Get document metadata for a list of document IDs."""
+        if not document_ids:
+            return {}
+
+        result = self.session.execute(
+            select(Document).where(Document.id.in_(document_ids))
+        )
+        documents = result.scalars().all()
+
+        return {
+            doc.id: {
+                "document_id": str(doc.id),
+                "title": doc.title,
+                "description": doc.description,
+                "language": doc.language,
+                "chunk_count": doc.chunk_count,
+            }
+            for doc in documents
+        }
+
+    def _get_or_create_conversation(
+        self,
+        conversation_id: UUID | None,
+        user_id: UUID,
+    ) -> Conversation:
+        """Get existing conversation or create a new one."""
+        if conversation_id:
+            result = self.session.execute(
+                select(Conversation).where(Conversation.id == conversation_id)
+            )
+            conversation = result.scalar_one_or_none()
+
+            if not conversation:
+                raise ValueError(f"Conversation {conversation_id} not found")
+
+            if conversation.user_id != user_id:
+                raise PermissionError(
+                    f"User {user_id} does not own conversation {conversation_id}"
+                )
+
+            return conversation
+        else:
+            conversation = Conversation(user_id=user_id)
+            self.session.add(conversation)
+            self.session.flush()
+            self.session.refresh(conversation)
+            return conversation

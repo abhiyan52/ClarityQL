@@ -123,7 +123,7 @@ ClarityQL (the codebase powering AstraMind) is a production-grade monorepo that 
 ## System Design — NLQ Pipeline
 
 ```mermaid
-flowchart LR
+flowchart TD
     U["User Query"] --> API["FastAPI /api/nlq/query"]
     API --> TQ["Task Queue (Celery)"]
     TQ --> INT["Intent Classifier"]
@@ -144,7 +144,7 @@ flowchart LR
 ## System Design — RAG Pipeline
 
 ```mermaid
-flowchart LR
+flowchart TD
     U["User Query"] --> API["FastAPI /api/rag/query"]
     API --> TQ["Task Queue (Celery)"]
     TQ --> EMB["Embedding Service"]

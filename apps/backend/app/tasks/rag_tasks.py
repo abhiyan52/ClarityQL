@@ -10,6 +10,9 @@ from celery import Task as CeleryTask, group
 from sqlalchemy import create_engine, select, update
 from sqlalchemy.orm import sessionmaker
 
+from app.models.conversation import Conversation, ConversationStatus
+from app.models.message import Message, MessageRole
+
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
 from app.models.task import Task, TaskStatus, TaskType
@@ -64,6 +67,24 @@ class CallbackTask(CeleryTask):
                 task.status = TaskStatus.FAILURE
                 task.error_message = str(exc)
                 task.completed_at = datetime.now(timezone.utc)
+
+                # Also mark conversation as failed if applicable
+                conversation_id = kwargs.get("conversation_id")
+                if conversation_id:
+                    conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
+                    if conversation:
+                        conversation.status = ConversationStatus.FAILED
+                        conversation.failure_reason = str(exc)
+                        
+                        # Add error message to chat history
+                        message = Message(
+                            conversation_id=UUID(conversation_id),
+                            role=MessageRole.ASSISTANT,
+                            content=f"Sorry, I couldn't process your request. {exc}",
+                            meta={"task_id": our_task_id, "error": str(exc)}
+                        )
+                        session.add(message)
+
                 session.commit()
             else:
                 logger.error(f"Task {our_task_id} not found in database (on_failure)")
@@ -90,6 +111,14 @@ class CallbackTask(CeleryTask):
                 task.status = TaskStatus.SUCCESS
                 task.result = retval
                 task.completed_at = datetime.now(timezone.utc)
+
+                # Update conversation status if applicable
+                conversation_id = kwargs.get("conversation_id")
+                if conversation_id:
+                    conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
+                    if conversation:
+                        conversation.status = ConversationStatus.COMPLETED
+                
                 session.commit()
             else:
                 logger.error(f"Task {our_task_id} not found in database (on_success)")
@@ -121,6 +150,16 @@ class CallbackTask(CeleryTask):
             task = session.query(Task).filter(Task.id == UUID(task_id)).first()
             if task and task.status == TaskStatus.REVOKED:
                 logger.info(f"Task {task_id} was revoked by user")
+                
+                # Also mark conversation as cancelled if applicable
+                # We need to find the task_args to get conversation_id
+                if task.task_args and task.task_args.get("conversation_id"):
+                    conv_id = task.task_args.get("conversation_id")
+                    conversation = session.query(Conversation).filter(Conversation.id == UUID(conv_id)).first()
+                    if conversation:
+                        conversation.status = ConversationStatus.CANCELLED
+                        session.commit()
+                        
                 return True
         return False
 
@@ -754,6 +793,24 @@ def process_rag_query_task(
         if self.check_revoked(task_id):
             return {}
 
+        conversation_uuid = None
+        if conversation_id:
+            conversation_uuid = UUID(conversation_id)
+
+        with SessionLocal() as session:
+            # Step 0: Save user message
+            user_msg = Message(
+                conversation_id=conversation_uuid,
+                role=MessageRole.USER,
+                content=query,
+                meta={
+                    "task_id": task_id,
+                    "selected_document_ids": document_ids
+                }
+            )
+            session.add(user_msg)
+            session.commit()
+
         # Step 2: Generate answer with LLM
         self.update_progress(task_id, 60, 100, "Generating answer...")
         
@@ -769,8 +826,23 @@ def process_rag_query_task(
         if self.check_revoked(task_id):
             return {}
 
-        # Step 3: Format response
+        # Step 3: Format response and save assistant message
         self.update_progress(task_id, 80, 100, "Finalizing response...")
+
+        with SessionLocal() as session:
+            # Save assistant message
+            assistant_msg = Message(
+                conversation_id=conversation_uuid,
+                role=MessageRole.ASSISTANT,
+                content=answer,
+                meta={
+                    "task_id": task_id,
+                    "chunks": rag_result.get("chunks", []),
+                    "documents": rag_result.get("documents", [])
+                }
+            )
+            session.add(assistant_msg)
+            session.commit()
 
         result_dict = {
             "conversation_id": rag_result["conversation_id"],

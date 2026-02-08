@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { Plus, MessageSquare, Trash2, PanelLeftClose, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -16,14 +17,23 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
     conversations,
     currentConversationId,
     createConversation,
-    setCurrentConversation,
+    selectConversation,
     deleteConversation,
+    loadConversations,
   } = useChatStore();
 
   const { user, logout } = useAuth();
 
+  useEffect(() => {
+    loadConversations();
+  }, [loadConversations]);
+
   const handleNewChat = () => {
     createConversation();
+  };
+
+  const handleSelectConversation = (id: string) => {
+    selectConversation(id);
   };
 
   return (
@@ -62,7 +72,7 @@ export function Sidebar({ isOpen, onClose }: SidebarProps) {
                 "hover:bg-accent cursor-pointer",
                 conversation.id === currentConversationId && "bg-accent"
               )}
-              onClick={() => setCurrentConversation(conversation.id)}
+              onClick={() => handleSelectConversation(conversation.id)}
             >
               <MessageSquare className="h-4 w-4 shrink-0 text-muted-foreground" />
               <span className="flex-1 truncate">{conversation.title}</span>

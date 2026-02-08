@@ -77,7 +77,7 @@ export async function uploadDocument(
 
   const formData = new FormData();
   formData.append("file", file);
-  
+
   if (options?.document_title) {
     formData.append("document_title", options.document_title);
   }
@@ -239,9 +239,12 @@ export interface RAGStreamCallbacks {
 
 /**
  * Submit a RAG query for background processing.
- * Returns a task_id that can be used to stream progress.
+ * Returns a task_id and conversation_id that can be used to stream progress.
  */
-export async function submitQuery(request: RAGQueryRequest): Promise<{ task_id: string }> {
+export async function submitQuery(
+  request: RAGQueryRequest,
+  options?: { signal?: AbortSignal }
+): Promise<{ task_id: string; conversation_id: string }> {
   const token = getAuthToken();
   if (!token) {
     throw new Error("Not authenticated");
@@ -254,6 +257,7 @@ export async function submitQuery(request: RAGQueryRequest): Promise<{ task_id: 
       "Content-Type": "application/json",
     },
     body: JSON.stringify(request),
+    signal: options?.signal,
   });
 
   if (!response.ok) {
@@ -273,6 +277,68 @@ export async function submitQuery(request: RAGQueryRequest): Promise<{ task_id: 
 }
 
 /**
+ * Fetch all RAG conversations for the user
+ */
+export async function fetchConversations(): Promise<Array<{
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  status: string;
+}>> {
+  const token = getAuthToken();
+  if (!token) throw new Error("Not authenticated");
+
+  const response = await fetch(`${API_BASE_URL}/api/rag/conversations`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) throw new Error("Failed to fetch conversations");
+  return response.json();
+}
+
+/**
+ * Fetch a single RAG conversation with messages
+ */
+export async function fetchConversation(id: string): Promise<{
+  id: string;
+  title: string;
+  status: string;
+  messages: Array<{
+    id: string;
+    role: "user" | "assistant";
+    content: string;
+    created_at: string;
+    meta?: any;
+  }>;
+}> {
+  const token = getAuthToken();
+  if (!token) throw new Error("Not authenticated");
+
+  const response = await fetch(`${API_BASE_URL}/api/rag/conversations/${id}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) throw new Error("Failed to fetch conversation");
+  return response.json();
+}
+
+/**
+ * Delete a RAG conversation
+ */
+export async function deleteConversation(id: string): Promise<void> {
+  const token = getAuthToken();
+  if (!token) throw new Error("Not authenticated");
+
+  const response = await fetch(`${API_BASE_URL}/api/rag/conversations/${id}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!response.ok) throw new Error("Failed to delete conversation");
+}
+
+/**
  * Stream task progress via SSE using fetch + ReadableStream.
  * EventSource doesn't support custom headers, so we use fetch instead.
  * 
@@ -283,7 +349,7 @@ export function streamTaskProgress(
   callbacks: RAGStreamCallbacks
 ): AbortController {
   const controller = new AbortController();
-  
+
   const connect = async () => {
     try {
       const token = getAuthToken();
@@ -315,11 +381,11 @@ export function streamTaskProgress(
 
       while (true) {
         const { done, value } = await reader.read();
-        
+
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        
+
         // Process complete SSE messages (terminated by \n\n)
         const messages = buffer.split("\n\n");
         buffer = messages.pop() || "";

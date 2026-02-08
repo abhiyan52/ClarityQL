@@ -6,13 +6,19 @@ import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { cn } from "@/lib/utils";
-import { uploadDocument, listDocuments, getTaskStatus, type Document } from "@/api/rag";
+import { uploadDocument, listDocuments, type Document } from "@/api/rag";
 import { RAGChatWindow } from "@/components/rag/RAGChatWindow";
+import { RAGSidebar } from "@/components/rag/RAGSidebar";
 import { DocumentViewer } from "@/components/rag/DocumentViewer";
+import { useRAGChatStore } from "@/store/ragChat";
 
 export function DocumentsPage() {
-  const [selectedDocuments, setSelectedDocuments] = useState<string[]>([]);
-  const [uploadingFiles, setUploadingFiles] = useState<Map<string, { taskId: string; fileName: string }>>(new Map());
+  const {
+    selectedDocumentIds,
+    setSelectedDocumentIds,
+    toggleDocumentSelection
+  } = useRAGChatStore();
+
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerDocumentId, setViewerDocumentId] = useState<string | undefined>();
   const queryClient = useQueryClient();
@@ -22,25 +28,15 @@ export function DocumentsPage() {
   const { data: documentsData, isLoading: isLoadingDocuments } = useQuery({
     queryKey: ["documents"],
     queryFn: () => listDocuments(),
-    refetchInterval: 5000, // Poll every 5 seconds to update processing status
+    refetchInterval: 5000,
   });
 
   const documents = documentsData?.documents || [];
 
   // Upload mutation
   const uploadMutation = useMutation({
-    mutationFn: uploadDocument,
-    onSuccess: (data, variables) => {
-      // Track the upload task
-      const file = variables as File;
-      setUploadingFiles(prev => new Map(prev).set(data.task_id, { taskId: data.task_id, fileName: file.name }));
-      
-      // Show notification if reprocessing
-      if (data.is_reprocessing) {
-        console.log(`📝 Document already exists. Reprocessing: ${file.name}`);
-      }
-      
-      // Refetch documents
+    mutationFn: (file: File) => uploadDocument(file),
+    onSuccess: (_data, _variables) => {
       queryClient.invalidateQueries({ queryKey: ["documents"] });
     },
   });
@@ -56,30 +52,22 @@ export function DocumentsPage() {
         console.error("Upload failed:", error);
       }
     }
-
-    // Reset input
     event.target.value = "";
   };
 
-  const toggleDocumentSelection = (documentId: string) => {
-    setSelectedDocuments(prev => {
-      if (prev.includes(documentId)) {
-        return prev.filter(id => id !== documentId);
-      } else {
-        return [...prev, documentId];
-      }
-    });
+  const handleToggleSelect = (documentId: string) => {
+    toggleDocumentSelection(documentId);
   };
 
   const selectAllDocuments = () => {
     const readyDocuments = documents
       .filter(doc => doc.processing_status === "ready")
       .map(doc => doc.id);
-    setSelectedDocuments(readyDocuments);
+    setSelectedDocumentIds(readyDocuments);
   };
 
   const clearSelection = () => {
-    setSelectedDocuments([]);
+    setSelectedDocumentIds([]);
   };
 
   const openViewer = (documentId?: string) => {
@@ -94,14 +82,19 @@ export function DocumentsPage() {
 
   // Count documents by status
   const readyCount = documents.filter(doc => doc.processing_status === "ready").length;
-  const processingCount = documents.filter(doc => 
+  const processingCount = documents.filter(doc =>
     !["ready", "failed"].includes(doc.processing_status)
   ).length;
 
   return (
     <div className="flex h-screen bg-background">
-      {/* Left Panel - Document Management */}
-      <div className="w-96 border-r bg-muted/20 flex flex-col">
+      {/* Column 1 - Chat History */}
+      <div className="w-64 border-r bg-muted/20 hidden lg:flex flex-col">
+        <RAGSidebar />
+      </div>
+
+      {/* Column 2 - Document Management */}
+      <div className="w-80 border-r bg-muted/20 flex flex-col">
         {/* Header */}
         <div className="border-b bg-background p-4">
           <div className="flex items-center gap-2 mb-3">
@@ -170,26 +163,26 @@ export function DocumentsPage() {
               >
                 Select All ({readyCount})
               </Button>
-              {selectedDocuments.length > 0 && (
+              {selectedDocumentIds.length > 0 && (
                 <Button
                   size="sm"
                   variant="outline"
                   onClick={clearSelection}
                   className="flex-1"
                 >
-                  Clear ({selectedDocuments.length})
+                  Clear ({selectedDocumentIds.length})
                 </Button>
               )}
             </div>
-            {(selectedDocuments.length > 0 || readyCount > 0) && (
+            {(selectedDocumentIds.length > 0 || readyCount > 0) && (
               <Button
                 size="sm"
                 variant="secondary"
-                onClick={() => openViewer(selectedDocuments[0])}
+                onClick={() => openViewer(selectedDocumentIds[0])}
                 className="w-full gap-2"
               >
                 <Eye className="h-4 w-4" />
-                View {selectedDocuments.length > 0 ? `Selected (${selectedDocuments.length})` : `All (${readyCount})`}
+                View {selectedDocumentIds.length > 0 ? `Selected (${selectedDocumentIds.length})` : `All (${readyCount})`}
               </Button>
             )}
           </div>
@@ -213,8 +206,8 @@ export function DocumentsPage() {
                 <DocumentCard
                   key={doc.id}
                   document={doc}
-                  isSelected={selectedDocuments.includes(doc.id)}
-                  onToggleSelect={() => toggleDocumentSelection(doc.id)}
+                  isSelected={selectedDocumentIds.includes(doc.id)}
+                  onToggleSelect={() => handleToggleSelect(doc.id)}
                   onView={() => openViewer(doc.id)}
                 />
               ))
@@ -223,10 +216,8 @@ export function DocumentsPage() {
         </ScrollArea>
       </div>
 
-      {/* Right Panel - RAG Chat */}
       <div className="flex-1 flex flex-col">
-        <RAGChatWindow 
-          selectedDocuments={selectedDocuments}
+        <RAGChatWindow
           totalDocuments={readyCount}
         />
       </div>
@@ -234,8 +225,8 @@ export function DocumentsPage() {
       {/* Document Viewer Modal */}
       {viewerOpen && (
         <DocumentViewer
-          documents={selectedDocuments.length > 0 
-            ? documents.filter(doc => selectedDocuments.includes(doc.id))
+          documents={selectedDocumentIds.length > 0
+            ? documents.filter(doc => selectedDocumentIds.includes(doc.id))
             : documents.filter(doc => doc.processing_status === "ready")
           }
           selectedDocumentId={viewerDocumentId}
@@ -267,7 +258,7 @@ function DocumentCard({ document, isSelected, onToggleSelect, onView }: Document
     >
       <div className="flex items-start gap-3">
         {/* Checkbox/Status Icon */}
-        <div 
+        <div
           className="shrink-0 mt-0.5 cursor-pointer"
           onClick={() => isReady && onToggleSelect()}
         >
@@ -295,7 +286,7 @@ function DocumentCard({ document, isSelected, onToggleSelect, onView }: Document
               {document.description}
             </p>
           )}
-          
+
           {/* Status */}
           <div className="flex items-center gap-2 mt-2">
             <span

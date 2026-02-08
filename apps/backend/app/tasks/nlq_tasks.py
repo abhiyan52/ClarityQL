@@ -13,8 +13,9 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.celery_app import celery_app
 from app.core.config import get_settings
-from app.models.conversation import Conversation
+from app.models.conversation import Conversation, ConversationStatus
 from app.models.conversation_state import ConversationState
+from app.models.message import Message, MessageRole
 from app.models.task import Task, TaskStatus, TaskType
 from packages.core.conversation import IntentClassifier, QueryIntent, merge_ast
 from packages.core.explainability import ExplainabilityBuilder
@@ -55,6 +56,24 @@ class CallbackTask(CeleryTask):
                 task.status = TaskStatus.FAILURE
                 task.error_message = str(exc)
                 task.completed_at = datetime.now(timezone.utc)
+                
+                # Also mark conversation as failed if applicable
+                conversation_id = kwargs.get("conversation_id")
+                if conversation_id:
+                    conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
+                    if conversation:
+                        conversation.status = ConversationStatus.FAILED
+                        conversation.failure_reason = str(exc)
+                        
+                        # Add error message to chat history
+                        message = Message(
+                            conversation_id=UUID(conversation_id),
+                            role=MessageRole.ASSISTANT,
+                            content=f"Sorry, I couldn't process your request. {exc}",
+                            meta={"task_id": our_task_id, "error": str(exc)}
+                        )
+                        session.add(message)
+                
                 session.commit()
             else:
                 logger.error(f"Task {our_task_id} not found in database (on_failure)")
@@ -76,6 +95,14 @@ class CallbackTask(CeleryTask):
                 task.status = TaskStatus.SUCCESS
                 task.result = retval
                 task.completed_at = datetime.now(timezone.utc)
+                
+                # Update conversation status if applicable
+                conversation_id = kwargs.get("conversation_id")
+                if conversation_id:
+                    conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
+                    if conversation:
+                        conversation.status = ConversationStatus.COMPLETED
+                
                 session.commit()
             else:
                 logger.error(f"Task {our_task_id} not found in database (on_success)")
@@ -109,6 +136,27 @@ class CallbackTask(CeleryTask):
                 logger.info(f"Task {task_id} was revoked by user")
                 return True
         return False
+
+    def mark_conversation_cancelled(self, conversation_id: str):
+        """Mark conversation as cancelled."""
+        if not conversation_id:
+            return
+            
+        with SessionLocal() as session:
+            conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
+            if conversation:
+                conversation.status = ConversationStatus.CANCELLED
+                session.commit()
+    def mark_conversation_cancelled(self, conversation_id: str):
+        """Mark conversation as cancelled."""
+        if not conversation_id:
+            return
+            
+        with SessionLocal() as session:
+            conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
+            if conversation:
+                conversation.status = ConversationStatus.CANCELLED
+                session.commit()
 
 
 def _create_default_tables():
@@ -159,8 +207,8 @@ def _create_default_tables():
     bind=True,
     base=CallbackTask,
     name="app.tasks.nlq_tasks.process_nlq_query_task",
-    soft_time_limit=120,
-    time_limit=150,
+    soft_time_limit=300,
+    time_limit=330,
     max_retries=0,
 )
 def process_nlq_query_task(
@@ -200,6 +248,7 @@ def process_nlq_query_task(
 
     # Check for revocation
     if self.check_revoked(task_id):
+        self.mark_conversation_cancelled(conversation_id)
         return {}
 
     with SessionLocal() as session:
@@ -235,7 +284,24 @@ def process_nlq_query_task(
             conversation_id = str(conversation.id)
 
         if self.check_revoked(task_id):
+            self.mark_conversation_cancelled(conversation_id)
             return {}
+
+        # Save user message
+        user_message = Message(
+            conversation_id=UUID(conversation_id),
+            role=MessageRole.USER,
+            content=query,
+            meta={"task_id": task_id}
+        )
+        session.add(user_message)
+        
+        # Update conversation title if new
+        if conversation.title is None or conversation.title == "New Conversation":
+            # Simple title generation: first 50 chars of query
+            conversation.title = query[:50] + ("..." if len(query) > 50 else "")
+            
+        session.commit()
 
         # Step 2: Intent classification and parsing (parallel if previous_ast exists)
         intent = QueryIntent.RESET
@@ -260,6 +326,7 @@ def process_nlq_query_task(
             parsed_ast = parser.parse(query)
 
         if self.check_revoked(task_id):
+            self.mark_conversation_cancelled(conversation_id)
             return {}
 
         # Step 3: Merge if REFINE
@@ -299,6 +366,7 @@ def process_nlq_query_task(
             self.update_progress(task_id, 60, 100, "Retrying with validation feedback...")
             
             if self.check_revoked(task_id):
+                self.mark_conversation_cancelled(conversation_id)
                 return {}
             
             retry_prompt = (
@@ -323,6 +391,7 @@ def process_nlq_query_task(
             raise Exception(f"Validation error: {validation_error}")
 
         if self.check_revoked(task_id):
+            self.mark_conversation_cancelled(conversation_id)
             return {}
 
         # Step 6: Resolve joins
@@ -381,6 +450,30 @@ def process_nlq_query_task(
                 ast_json=ast_dict,
             )
             session.add(state)
+        
+        # Save assistant message
+        assistant_message = Message(
+            conversation_id=UUID(conversation_id),
+            role=MessageRole.ASSISTANT,
+            content="Here are your results:",
+            meta={
+                "task_id": task_id,
+                "response": {
+                    "visualization": visualization.to_dict(),
+                    "sql": sql_string,
+                    "columns": columns,
+                    "rows": rows,
+                    "explainability": explanation.to_dict(),
+                }
+            }
+        )
+        session.add(assistant_message)
+        
+        # Mark conversation as completed/active
+        # re-fetch conversation to avoid detached instance errors
+        conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
+        if conversation:
+            conversation.status = ConversationStatus.ACTIVE  # Ready for next query
         
         session.commit()
 

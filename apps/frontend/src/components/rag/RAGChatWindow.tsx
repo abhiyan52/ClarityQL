@@ -1,40 +1,35 @@
 import { useState, useRef, useEffect } from "react";
 import ReactMarkdown from "react-markdown";
-import { Send, Loader2, FileText, MessageSquarePlus, X } from "lucide-react";
+import { Send, Loader2, FileText, MessageSquarePlus, X, Bot, User } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
-import { Card } from "@/components/ui/card";
 import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
-import { Bot, User } from "lucide-react";
-import { submitQuery, streamTaskProgress, cancelTask, type ChunkResult, type RAGQueryResponse } from "@/api/rag";
+import { useQueryClient } from "@tanstack/react-query";
+import { streamTaskProgress, cancelTask, type ChunkResult, type RAGQueryResponse, submitQuery } from "@/api/rag";
+import { useRAGChatStore, type RAGMessage as Message } from "@/store/ragChat";
 
 interface RAGChatWindowProps {
-  selectedDocuments: string[];
   totalDocuments: number;
 }
 
-interface Message {
-  id: string;
-  role: "user" | "assistant";
-  content: string;
-  timestamp: Date;
-  isLoading?: boolean;
-  progressPercentage?: number;
-  progressMessage?: string;
-  taskId?: string;
-  chunks?: ChunkResult[];
-  conversationId?: string;
-  error?: string;
-}
+export function RAGChatWindow({ totalDocuments }: RAGChatWindowProps) {
+  const queryClient = useQueryClient();
+  const {
+    messages,
+    currentConversationId,
+    isLoading,
+    addMessage,
+    updateMessage,
+    setLoading,
+    setAbortController,
+    cancelCurrentQuery,
+    createConversation,
+    selectedDocumentIds,
+  } = useRAGChatStore();
 
-export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWindowProps) {
-  const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
-  const [isLoading, setIsLoading] = useState(false);
-  const [conversationId, setConversationId] = useState<string | undefined>();
-  const [abortController, setAbortController] = useState<AbortController | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -43,7 +38,9 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages]);
+    // Refetch documents when messages change (e.g., new conversation created)
+    queryClient.invalidateQueries({ queryKey: ["documents"] });
+  }, [messages, queryClient]);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -54,15 +51,8 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
     }
   }, [input]);
 
-  const updateMessage = (id: string, updates: Partial<Message>) => {
-    setMessages(prev =>
-      prev.map(msg => (msg.id === id ? { ...msg, ...updates } : msg))
-    );
-  };
-
   const handleCancel = async () => {
-    if (abortController) {
-      // Find the current loading message to get task ID
+    if (isLoading) {
       const loadingMessage = messages.find(m => m.isLoading && m.taskId);
       if (loadingMessage?.taskId) {
         try {
@@ -71,8 +61,7 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
           console.error("Failed to cancel task:", error);
         }
       }
-      abortController.abort();
-      setAbortController(null);
+      cancelCurrentQuery();
     }
   };
 
@@ -80,50 +69,47 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
     const trimmed = input.trim();
     if (!trimmed || isLoading) return;
 
-    // Add user message
-    const userMessage: Message = {
-      id: Date.now().toString(),
+    if (!currentConversationId) {
+      createConversation();
+    }
+
+    addMessage({
       role: "user",
       content: trimmed,
-      timestamp: new Date(),
-    };
+    });
 
-    setMessages(prev => [...prev, userMessage]);
     setInput("");
-    setIsLoading(true);
+    setLoading(true);
 
-    // Add loading assistant message
-    const assistantId = (Date.now() + 1).toString();
-    setMessages(prev => [
-      ...prev,
-      {
-        id: assistantId,
-        role: "assistant",
-        content: "",
-        timestamp: new Date(),
-        isLoading: true,
-        progressPercentage: 0,
-        progressMessage: "Starting query...",
-      },
-    ]);
+    const assistantId = addMessage({
+      role: "assistant",
+      content: "",
+      isLoading: true,
+      progressPercentage: 0,
+      progressMessage: "Starting query...",
+    });
+
+    const controller = new AbortController();
+    setAbortController(controller);
 
     try {
-      // Step 1: Submit query for background processing
-      const { task_id } = await submitQuery({
+      const { task_id, conversation_id: newConvId } = await submitQuery({
         query: trimmed,
-        document_ids: selectedDocuments.length > 0 ? selectedDocuments : undefined,
-        conversation_id: conversationId,
+        document_ids: selectedDocumentIds.length > 0 ? selectedDocumentIds : undefined,
+        conversation_id: (currentConversationId?.startsWith("temp-") ? undefined : currentConversationId) as string | undefined,
         top_k: 5,
         min_similarity: 0.0,
-      });
+      }, { signal: controller.signal });
 
-      // Update message with task ID
+      if (currentConversationId?.startsWith("temp-")) {
+        useRAGChatStore.setState({ currentConversationId: newConvId });
+      }
+
       updateMessage(assistantId, {
         taskId: task_id,
       });
 
-      // Step 2: Stream progress via SSE
-      const controller = streamTaskProgress(task_id, {
+      streamTaskProgress(task_id, {
         onProgress: (data) => {
           updateMessage(assistantId, {
             progressPercentage: data.percentage,
@@ -131,18 +117,14 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
           });
         },
         onComplete: (response: RAGQueryResponse) => {
-          // Update conversation ID for context continuity
-          setConversationId(response.conversation_id);
-
           updateMessage(assistantId, {
             content: response.answer || "I couldn't find any relevant information in the selected documents for your query.",
             chunks: response.chunks,
-            conversationId: response.conversation_id,
             isLoading: false,
             progressPercentage: undefined,
             progressMessage: undefined,
           });
-          setIsLoading(false);
+          setLoading(false);
           setAbortController(null);
         },
         onError: (error) => {
@@ -153,7 +135,7 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
             progressMessage: undefined,
             error: error,
           });
-          setIsLoading(false);
+          setLoading(false);
           setAbortController(null);
         },
         onCancelled: () => {
@@ -163,22 +145,29 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
             progressPercentage: undefined,
             progressMessage: undefined,
           });
-          setIsLoading(false);
+          setLoading(false);
           setAbortController(null);
         },
       });
 
-      // Store controller so cancel button can use it
-      setAbortController(controller);
     } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        updateMessage(assistantId, {
+          content: "Query was cancelled.",
+          isLoading: false,
+          progressPercentage: undefined,
+          progressMessage: undefined,
+        });
+        return;
+      }
+
       let errorMessage = "Please try again.";
       if (error instanceof Error) {
         errorMessage = error.message;
       } else if (typeof error === "string") {
         errorMessage = error;
-      } else if (error && typeof error === "object") {
-        errorMessage = JSON.stringify(error);
       }
+
       updateMessage(assistantId, {
         content: `Sorry, I couldn't submit your query. ${errorMessage}`,
         isLoading: false,
@@ -186,7 +175,7 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
         progressMessage: undefined,
         error: errorMessage,
       });
-      setIsLoading(false);
+      setLoading(false);
       setAbortController(null);
     }
   };
@@ -198,14 +187,13 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
     }
   };
 
-  const documentCountText = 
-    selectedDocuments.length === 0
+  const documentCountText =
+    selectedDocumentIds.length === 0
       ? `All documents (${totalDocuments})`
-      : `${selectedDocuments.length} of ${totalDocuments} selected`;
+      : `${selectedDocumentIds.length} of ${totalDocuments} selected`;
 
   return (
     <div className="flex h-full flex-col">
-      {/* Header */}
       <div className="border-b bg-background p-4">
         <div className="flex items-center justify-between">
           <div>
@@ -222,24 +210,78 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
         </div>
       </div>
 
-      {/* Messages area */}
       <ScrollArea className="flex-1" ref={scrollRef}>
         {messages.length === 0 ? (
-          <EmptyState totalDocuments={totalDocuments} selectedCount={selectedDocuments.length} />
+          <EmptyState totalDocuments={totalDocuments} selectedCount={selectedDocumentIds.length} />
         ) : (
-          <div className="divide-y">
-            {messages.map(message => (
-              <ChatMessage 
-                key={message.id} 
-                message={message} 
-                onCancel={handleCancel}
-              />
-            ))}
+          <div className="flex flex-col gap-4 py-4">
+            {messages.map((message) => {
+              const isUser = message.role === "user";
+              return (
+                <div
+                  key={message.id}
+                  className={cn(
+                    "flex gap-3 px-4",
+                    isUser ? "flex-row-reverse" : "flex-row"
+                  )}
+                >
+                  <Avatar className="h-8 w-8 shrink-0">
+                    <AvatarFallback
+                      className={cn(
+                        isUser ? "bg-primary text-primary-foreground" : "bg-chart-1 text-white"
+                      )}
+                    >
+                      {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
+                    </AvatarFallback>
+                  </Avatar>
+
+                  <div className={cn(
+                    "flex-1 space-y-2 overflow-hidden",
+                    isUser ? "text-right" : "text-left"
+                  )}>
+                    <div className={cn(
+                      "flex items-center gap-2",
+                      isUser ? "justify-end" : "justify-start"
+                    )}>
+                      <span className="text-sm font-medium">
+                        {isUser ? "You" : "ClarityQL"}
+                      </span>
+                      <span className="text-xs text-muted-foreground">
+                        {message.timestamp.toLocaleTimeString()}
+                      </span>
+                    </div>
+
+                    {message.isLoading ? (
+                      <LoadingIndicator
+                        message={message}
+                        onCancel={handleCancel}
+                      />
+                    ) : (
+                      <>
+                        <div className={cn(
+                          "text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none",
+                          message.error && "text-destructive",
+                          isUser ? "ml-auto" : "mr-auto"
+                        )}>
+                          {isUser ? (
+                            <p className="whitespace-pre-wrap">{message.content}</p>
+                          ) : (
+                            <ReactMarkdown>{message.content}</ReactMarkdown>
+                          )}
+                        </div>
+                        {message.chunks && message.chunks.length > 0 && (
+                          <ChunkResults chunks={message.chunks} />
+                        )}
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
           </div>
         )}
       </ScrollArea>
 
-      {/* Input area */}
       <div className="border-t bg-background p-4">
         <div className="mx-auto max-w-4xl">
           <div className="relative flex items-end gap-2 rounded-lg border bg-background p-2 shadow-sm focus-within:ring-2 focus-within:ring-ring">
@@ -273,9 +315,9 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
           <p className="mt-2 text-center text-xs text-muted-foreground">
             {totalDocuments === 0
               ? "Upload documents to start querying"
-              : selectedDocuments.length === 0
-              ? "Searching all documents • Select specific documents to narrow your search"
-              : `Searching ${selectedDocuments.length} selected document${selectedDocuments.length > 1 ? "s" : ""}`}
+              : selectedDocumentIds.length === 0
+                ? "Searching all documents • Select specific documents to narrow your search"
+                : `Searching ${selectedDocumentIds.length} selected document${selectedDocumentIds.length > 1 ? "s" : ""}`}
           </p>
         </div>
       </div>
@@ -283,78 +325,11 @@ export function RAGChatWindow({ selectedDocuments, totalDocuments }: RAGChatWind
   );
 }
 
-interface ChatMessageProps {
-  message: Message;
-}
-
-function ChatMessage({ message, onCancel }: ChatMessageProps & { onCancel: () => void }) {
-  const isUser = message.role === "user";
-  const isLoading = message.isLoading;
-  const hasProgress = typeof message.progressPercentage === 'number';
-
+function ChunkResults({ chunks }: { chunks: ChunkResult[] }) {
   return (
-    <div
-      className={cn(
-        "flex gap-4 p-4",
-        isUser ? "bg-background" : "bg-muted/50"
-      )}
-    >
-      <Avatar className="h-8 w-8 shrink-0">
-        <AvatarFallback
-          className={cn(
-            isUser ? "bg-primary text-primary-foreground" : "bg-chart-1 text-white"
-          )}
-        >
-          {isUser ? <User className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
-        </AvatarFallback>
-      </Avatar>
-
-      <div className="flex-1 space-y-2 overflow-hidden">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-medium">
-            {isUser ? "You" : "ClarityQL"}
-          </span>
-          <span className="text-xs text-muted-foreground">
-            {message.timestamp.toLocaleTimeString()}
-          </span>
-        </div>
-
-        {isLoading ? (
-          <LoadingIndicator 
-            message={message} 
-            onCancel={onCancel}
-          />
-        ) : (
-          <>
-            <div className={cn(
-              "text-sm leading-relaxed prose prose-sm dark:prose-invert max-w-none",
-              message.error && "text-destructive"
-            )}>
-              {isUser ? (
-                <p className="whitespace-pre-wrap">{message.content}</p>
-              ) : (
-                <ReactMarkdown>{message.content}</ReactMarkdown>
-              )}
-            </div>
-            {message.chunks && message.chunks.length > 0 && (
-              <ChunkResults chunks={message.chunks} />
-            )}
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
-
-interface ChunkResultsProps {
-  chunks: ChunkResult[];
-}
-
-function ChunkResults({ chunks }: ChunkResultsProps) {
-  return (
-    <div className="mt-4 space-y-3">
-      {chunks.map((chunk, idx) => (
-        <Card key={chunk.chunk_id} className="p-3 bg-muted/50">
+    <div className="mt-4 space-y-3 text-left">
+      {chunks.map((chunk) => (
+        <div key={chunk.chunk_id} className="p-3 bg-muted/50 rounded-lg space-y-2">
           <div className="flex items-start justify-between gap-2 mb-2">
             <div className="flex items-center gap-2 text-xs">
               <FileText className="h-3 w-3 text-muted-foreground" />
@@ -375,16 +350,16 @@ function ChunkResults({ chunks }: ChunkResultsProps) {
               Section: {chunk.section}
             </p>
           )}
-        </Card>
+        </div>
       ))}
     </div>
   );
 }
 
-function LoadingIndicator({ 
-  message, 
-  onCancel 
-}: { 
+function LoadingIndicator({
+  message,
+  onCancel
+}: {
   message: Message;
   onCancel: () => void;
 }) {
@@ -424,12 +399,7 @@ function LoadingIndicator({
   );
 }
 
-interface EmptyStateProps {
-  totalDocuments: number;
-  selectedCount: number;
-}
-
-function EmptyState({ totalDocuments, selectedCount }: EmptyStateProps) {
+function EmptyState({ totalDocuments, selectedCount }: { totalDocuments: number; selectedCount: number }) {
   return (
     <div className="flex h-full flex-col items-center justify-center p-8 text-center">
       <div className="rounded-full bg-primary/10 p-4">
@@ -441,25 +411,6 @@ function EmptyState({ totalDocuments, selectedCount }: EmptyStateProps) {
           ? "Upload documents to start asking questions and getting AI-powered answers."
           : `Ask questions about ${selectedCount === 0 ? "all your documents" : `the ${selectedCount} selected document${selectedCount > 1 ? "s" : ""}`}. The AI will search through them and provide relevant answers.`}
       </p>
-      {totalDocuments > 0 && (
-        <div className="mt-6 grid gap-2 text-sm">
-          <p className="font-medium text-muted-foreground">Try asking:</p>
-          <div className="flex flex-wrap justify-center gap-2">
-            {[
-              "What are the key findings?",
-              "Summarize the main points",
-              "What does it say about...?",
-            ].map(example => (
-              <button
-                key={example}
-                className="rounded-full border bg-background px-3 py-1.5 text-sm hover:bg-accent"
-              >
-                {example}
-              </button>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }

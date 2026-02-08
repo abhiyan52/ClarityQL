@@ -8,6 +8,7 @@ from app.models.document import Document, DocumentSourceType, DocumentVisibility
 from app.models.chunk import Chunk, EMBEDDING_DIMENSION
 from app.models.query_log import QueryLog
 from app.models.task import Task, TaskStatus, TaskType
+from app.models.message import Message, MessageRole
 
 __all__ = [
     "Tenant",
@@ -23,4 +24,6 @@ __all__ = [
     "Task",
     "TaskStatus",
     "TaskType",
+    "Message",
+    "MessageRole",
 ]

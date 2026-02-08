@@ -7,10 +7,13 @@ from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import desc, select
+from sqlalchemy.orm import selectinload
 
 from app.core.celery_app import celery_app
 from app.core.dependencies import AsyncSessionDep, CurrentUser
+from app.models.conversation import Conversation, ConversationStatus
+from app.models.message import Message, MessageRole
 from app.models.task import Task, TaskStatus, TaskType
 from app.schemas.nlq import (
     NLQQueryRequest,
@@ -19,6 +22,115 @@ from app.schemas.nlq import (
 from app.services.analytics_nlq.service import get_nlq_service
 
 router = APIRouter()
+
+
+@router.get("/conversations")
+async def list_conversations(
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+) -> list[dict]:
+    """List all NLQ conversations for the current user."""
+    result = await session.execute(
+        select(Conversation)
+        .where(
+            Conversation.user_id == current_user.id,
+            Conversation.conversation_type == "nlq"
+        )
+        .order_by(desc(Conversation.updated_at))
+    )
+    conversations = result.scalars().all()
+    
+    return [
+        {
+            "id": str(c.id),
+            "title": c.title or "New Conversation",
+            "created_at": c.created_at.isoformat(),
+            "updated_at": c.updated_at.isoformat(),
+            "status": c.status.value,
+        }
+        for c in conversations
+    ]
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation(
+    conversation_id: UUID,
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+) -> dict:
+    """Get NLQ conversation details and messages."""
+    result = await session.execute(
+        select(Conversation)
+        .options(selectinload(Conversation.messages))
+        .where(
+            Conversation.id == conversation_id,
+            Conversation.conversation_type == "nlq"
+        )
+    )
+    conversation = result.scalar_one_or_none()
+    
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+        
+    if conversation.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this conversation",
+        )
+        
+    return {
+        "id": str(conversation.id),
+        "title": conversation.title or "New Conversation",
+        "created_at": conversation.created_at.isoformat(),
+        "updated_at": conversation.updated_at.isoformat(),
+        "status": conversation.status.value,
+        "messages": [
+            {
+                "id": str(m.id),
+                "role": m.role.value,
+                "content": m.content,
+                "created_at": m.created_at.isoformat(),
+                "meta": m.meta,
+            }
+            for m in conversation.messages
+        ]
+    }
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: UUID,
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+):
+    """Delete an NLQ conversation."""
+    result = await session.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.conversation_type == "nlq"
+        )
+    )
+    conversation = result.scalar_one_or_none()
+    
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+        
+    if conversation.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this conversation",
+        )
+        
+    await session.delete(conversation)
+    await session.commit()
+    
+    return {"message": "Conversation deleted successfully"}
 
 
 @router.post("/query", status_code=status.HTTP_202_ACCEPTED)
@@ -45,6 +157,39 @@ async def submit_nlq_query(
     Raises:
         HTTPException 401: If not authenticated.
     """
+    # Create conversation if not provided
+    conversation_id = payload.conversation_id
+    if not conversation_id:
+        conversation = Conversation(
+            user_id=current_user.id,
+            title="New Conversation",
+            status=ConversationStatus.ACTIVE,
+            conversation_type="nlq"
+        )
+        session.add(conversation)
+        await session.commit()
+        await session.refresh(conversation)
+        conversation_id = conversation.id
+    else:
+        # Verify conversation exists and belongs to user
+        result = await session.execute(
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.conversation_type == "nlq"
+            )
+        )
+        conversation = result.scalar_one_or_none()
+        if not conversation:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Conversation not found",
+            )
+        if conversation.user_id != current_user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not authorized to access this conversation",
+            )
+
     # Create task record
     task = Task(
         tenant_id=current_user.tenant_id,
@@ -53,7 +198,7 @@ async def submit_nlq_query(
         task_name=f"NLQ Query: {payload.query[:50]}...",
         task_args={
             "query": payload.query,
-            "conversation_id": str(payload.conversation_id) if payload.conversation_id else None,
+            "conversation_id": str(conversation_id),
         },
         status=TaskStatus.PENDING,
         progress_current=0,
@@ -72,7 +217,7 @@ async def submit_nlq_query(
             "query": payload.query,
             "user_id": str(current_user.id),
             "tenant_id": str(current_user.tenant_id),
-            "conversation_id": str(payload.conversation_id) if payload.conversation_id else None,
+            "conversation_id": str(conversation_id),
         }
     )
 
@@ -81,7 +226,10 @@ async def submit_nlq_query(
     task.started_at = datetime.utcnow()
     await session.commit()
 
-    return {"task_id": str(task.id)}
+    return {
+        "task_id": str(task.id),
+        "conversation_id": str(conversation_id)
+    }
 
 
 @router.get("/tasks/{task_id}/stream")
@@ -244,6 +392,18 @@ async def cancel_task(
     # Update task status
     task.status = TaskStatus.REVOKED
     task.completed_at = datetime.utcnow()
+    
+    # Also cancel conversation if associated
+    if task.task_args and "conversation_id" in task.task_args:
+        conv_id = task.task_args["conversation_id"]
+        if conv_id:
+            result = await session.execute(
+                select(Conversation).where(Conversation.id == UUID(conv_id))
+            )
+            conversation = result.scalar_one_or_none()
+            if conversation:
+                conversation.status = ConversationStatus.CANCELLED
+    
     await session.commit()
 
     return {"message": "Task cancelled successfully"}

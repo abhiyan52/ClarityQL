@@ -30,11 +30,11 @@ function getAuthHeaders(): HeadersInit {
   const headers: HeadersInit = {
     "Content-Type": "application/json",
   };
-  
+
   if (token) {
     headers.Authorization = `Bearer ${token}`;
   }
-  
+
   return headers;
 }
 
@@ -42,11 +42,19 @@ function getAuthHeaders(): HeadersInit {
  * Submit a query for background processing.
  * Returns a task_id that can be used to stream progress.
  */
-export async function submitQuery(request: QueryRequest): Promise<{ task_id: string }> {
+/**
+ * Submit a query for background processing.
+ * Returns a task_id that can be used to stream progress.
+ */
+export async function submitQuery(
+  request: QueryRequest,
+  options?: { signal?: AbortSignal }
+): Promise<{ task_id: string; conversation_id: string }> {
   const response = await fetch(`${API_BASE_URL}/api/nlq/query`, {
     method: "POST",
     headers: getAuthHeaders(),
     body: JSON.stringify(request),
+    signal: options?.signal,
   });
 
   if (!response.ok) {
@@ -73,10 +81,11 @@ export async function submitQuery(request: QueryRequest): Promise<{ task_id: str
  */
 export function streamTaskProgress(
   taskId: string,
-  callbacks: StreamCallbacks
+  callbacks: StreamCallbacks,
+  existingController?: AbortController
 ): AbortController {
-  const controller = new AbortController();
-  
+  const controller = existingController || new AbortController();
+
   const connect = async () => {
     try {
       const token = getAuthToken();
@@ -108,11 +117,11 @@ export function streamTaskProgress(
 
       while (true) {
         const { done, value } = await reader.read();
-        
+
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        
+
         // Process complete SSE messages (terminated by \n\n)
         const messages = buffer.split("\n\n");
         buffer = messages.pop() || "";
@@ -200,4 +209,48 @@ export async function getSchema(): Promise<{
   }
 
   return response.json();
+}
+
+/**
+ * Fetch all conversations for the current user.
+ */
+export async function fetchConversations(): Promise<any[]> {
+  const response = await fetch(`${API_BASE_URL}/api/nlq/conversations`, {
+    headers: getAuthHeaders(),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch conversations: HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Fetch a single conversation with messages.
+ */
+export async function fetchConversation(id: string): Promise<any> {
+  const response = await fetch(`${API_BASE_URL}/api/nlq/conversations/${id}`, {
+    headers: getAuthHeaders(),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch conversation: HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Delete a conversation.
+ */
+export async function deleteConversation(id: string): Promise<void> {
+  const response = await fetch(`${API_BASE_URL}/api/nlq/conversations/${id}`, {
+    method: "DELETE",
+    headers: getAuthHeaders(),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to delete conversation: HTTP ${response.status}`);
+  }
 }

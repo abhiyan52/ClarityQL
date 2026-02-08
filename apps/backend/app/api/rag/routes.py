@@ -22,8 +22,12 @@ from app.tasks.rag_tasks import (
     generate_embeddings_for_pending_documents_task,
     process_rag_query_task,
 )
+from app.models.conversation import Conversation, ConversationStatus
+from app.models.message import Message, MessageRole
 from app.services.rag.query_service import RAGQueryService
 from pydantic import BaseModel, Field
+from sqlalchemy import desc
+from sqlalchemy.orm import selectinload
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -31,6 +35,27 @@ logger = logging.getLogger(__name__)
 # Directory for uploaded files (configure via settings in production)
 UPLOAD_DIR = Path("/tmp/clarityql_uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _extract_original_filename(storage_path: str | None) -> str | None:
+    """
+    Extract the original filename from storage path.
+    
+    Storage path format: {user_id}_{original_filename}
+    Example: /tmp/clarityql_uploads/550e8400-e29b-41d4-a716-446655440000_report.pdf
+    Returns: report.pdf
+    """
+    if not storage_path:
+        return None
+    # Get the basename (filename part)
+    basename = storage_path.split("/")[-1]
+    # Remove the user_id prefix (UUID followed by underscore)
+    # UUID format: 8-4-4-4-12 hex characters (but be flexible with last segment)
+    import re
+    match = re.match(r'^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]+)_(.+)', basename, re.IGNORECASE)
+    if match:
+        return match.group(2)
+    return basename
 
 
 # ──────────────────────────────────────────────
@@ -84,6 +109,115 @@ class RAGQueryResponse(BaseModel):
 # ──────────────────────────────────────────────
 
 
+@router.get("/conversations")
+async def list_rag_conversations(
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+) -> list[dict]:
+    """List all RAG conversations for the current user."""
+    result = await session.execute(
+        select(Conversation)
+        .where(
+            Conversation.user_id == current_user.id,
+            Conversation.conversation_type == "rag"
+        )
+        .order_by(desc(Conversation.updated_at))
+    )
+    conversations = result.scalars().all()
+    
+    return [
+        {
+            "id": str(c.id),
+            "title": c.title or "New Document Chat",
+            "created_at": c.created_at.isoformat(),
+            "updated_at": c.updated_at.isoformat(),
+            "status": c.status.value,
+        }
+        for c in conversations
+    ]
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_rag_conversation(
+    conversation_id: UUID,
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+) -> dict:
+    """Get RAG conversation details and messages."""
+    result = await session.execute(
+        select(Conversation)
+        .options(selectinload(Conversation.messages))
+        .where(
+            Conversation.id == conversation_id,
+            Conversation.conversation_type == "rag"
+        )
+    )
+    conversation = result.scalar_one_or_none()
+    
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+        
+    if conversation.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this conversation",
+        )
+        
+    return {
+        "id": str(conversation.id),
+        "title": conversation.title or "New Document Chat",
+        "created_at": conversation.created_at.isoformat(),
+        "updated_at": conversation.updated_at.isoformat(),
+        "status": conversation.status.value,
+        "messages": [
+            {
+                "id": str(m.id),
+                "role": m.role.value,
+                "content": m.content,
+                "created_at": m.created_at.isoformat(),
+                "meta": m.meta,
+            }
+            for m in conversation.messages
+        ]
+    }
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_rag_conversation(
+    conversation_id: UUID,
+    current_user: CurrentUser,
+    session: AsyncSessionDep,
+) -> dict:
+    """Delete a RAG conversation."""
+    result = await session.execute(
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.conversation_type == "rag"
+        )
+    )
+    conversation = result.scalar_one_or_none()
+    
+    if not conversation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+        
+    if conversation.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to delete this conversation",
+        )
+        
+    await session.delete(conversation)
+    await session.commit()
+    
+    return {"message": "Conversation deleted successfully"}
+
+
 @router.post("/query", status_code=status.HTTP_202_ACCEPTED)
 async def query_documents(
     request: RAGQueryRequest,
@@ -92,41 +226,12 @@ async def query_documents(
 ) -> dict:
     """
     Submit a RAG query for background processing.
-
-    This endpoint creates a task and returns immediately with a task_id.
-    The client should then connect to /tasks/{task_id}/stream to receive
-    progress updates and final results via Server-Sent Events (SSE).
-
-    Args:
-        request: Query request with query text, optional document IDs, etc.
-        session: Database session (injected)
-        current_user: Authenticated user (injected)
-
-    Returns:
-        Dict with task_id for progress tracking
-
-    Raises:
-        HTTPException 400: If document IDs are invalid
-        HTTPException 500: If task creation fails
-
-    Example:
-        ```bash
-        curl -X POST http://localhost:8000/api/rag/query \\
-          -H "Authorization: Bearer <token>" \\
-          -H "Content-Type: application/json" \\
-          -d '{
-            "query": "What are the key findings?",
-            "document_ids": ["uuid1", "uuid2"],
-            "top_k": 5
-          }'
-        ```
     """
     try:
         # Validate document IDs if provided
         document_ids = None
         if request.document_ids:
             try:
-                # Validate UUID format but keep as strings for Celery task
                 for doc_id in request.document_ids:
                     UUID(doc_id)
                 document_ids = request.document_ids
@@ -136,17 +241,39 @@ async def query_documents(
                     detail=f"Invalid document ID format: {str(e)}",
                 )
 
-        # Validate conversation ID if provided
+        # Handle conversation
         conversation_id = None
         if request.conversation_id:
             try:
-                UUID(request.conversation_id)
-                conversation_id = request.conversation_id
+                conv_uuid = UUID(request.conversation_id)
+                result = await session.execute(
+                    select(Conversation).where(Conversation.id == conv_uuid)
+                )
+                conversation = result.scalar_one_or_none()
+                if not conversation:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Conversation not found",
+                    )
+                conversation_id = str(conversation.id)
+                # Update status
+                conversation.status = ConversationStatus.ACTIVE
             except ValueError:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="Invalid conversation ID format",
                 )
+        else:
+            # Create new RAG conversation
+            conversation = Conversation(
+                user_id=current_user.id,
+                conversation_type="rag",
+                title=f"Chat: {request.query[:30]}...",
+                status=ConversationStatus.ACTIVE
+            )
+            session.add(conversation)
+            await session.flush()
+            conversation_id = str(conversation.id)
 
         # Create task record
         task = Task(
@@ -188,7 +315,10 @@ async def query_documents(
         task.started_at = datetime.utcnow()
         await session.commit()
 
-        return {"task_id": str(task.id)}
+        return {
+            "task_id": str(task.id),
+            "conversation_id": conversation_id
+        }
 
     except HTTPException:
         raise
@@ -757,6 +887,7 @@ async def list_documents(
                 {
                     "id": str(doc.id),
                     "title": doc.title,
+                    "file_name": _extract_original_filename(doc.storage_path),
                     "description": doc.description,
                     "language": doc.language,
                     "chunk_count": doc.chunk_count,
@@ -811,6 +942,7 @@ async def get_document(
         content={
             "id": str(document.id),
             "title": document.title,
+            "file_name": _extract_original_filename(document.storage_path),
             "description": document.description,
             "language": document.language,
             "chunk_count": document.chunk_count,

@@ -1,16 +1,18 @@
 import { useState, useRef, useEffect, KeyboardEvent } from "react";
-import { Send, Loader2 } from "lucide-react";
+import { Send, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
 interface ChatInputProps {
   onSend: (message: string) => void;
+  onCancel?: () => void;
   isLoading?: boolean;
   placeholder?: string;
 }
 
 export function ChatInput({
   onSend,
+  onCancel,
   isLoading = false,
   placeholder = "Ask a question about your data...",
 }: ChatInputProps) {
@@ -59,18 +61,26 @@ export function ChatInput({
               "disabled:cursor-not-allowed disabled:opacity-50"
             )}
           />
-          <Button
-            size="icon"
-            onClick={handleSend}
-            disabled={!message.trim() || isLoading}
-            className="shrink-0"
-          >
-            {isLoading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
+          {isLoading && onCancel ? (
+            <Button
+              size="icon"
+              variant="destructive"
+              onClick={onCancel}
+              className="shrink-0"
+              title="Stop generating"
+            >
+              <Square className="h-4 w-4 fill-current" />
+            </Button>
+          ) : (
+            <Button
+              size="icon"
+              onClick={handleSend}
+              disabled={!message.trim() || isLoading}
+              className="shrink-0"
+            >
               <Send className="h-4 w-4" />
-            )}
-          </Button>
+            </Button>
+          )}
         </div>
         <p className="mt-2 text-center text-xs text-muted-foreground">
           Try: "Show me total revenue by region" or "What were the top 10 products last month?"

@@ -147,16 +147,6 @@ class CallbackTask(CeleryTask):
             if conversation:
                 conversation.status = ConversationStatus.CANCELLED
                 session.commit()
-    def mark_conversation_cancelled(self, conversation_id: str):
-        """Mark conversation as cancelled."""
-        if not conversation_id:
-            return
-            
-        with SessionLocal() as session:
-            conversation = session.query(Conversation).filter(Conversation.id == UUID(conversation_id)).first()
-            if conversation:
-                conversation.status = ConversationStatus.CANCELLED
-                session.commit()
 
 
 def _create_default_tables():
@@ -276,6 +266,12 @@ def process_nlq_query_task(
                         previous_ast = QueryAST.model_validate(state.ast_json)
                     except Exception as e:
                         logger.warning(f"Failed to load previous AST: {e}")
+            else:
+                # Conversation doesn't exist or belongs to different user - create new
+                conversation = Conversation(user_id=UUID(user_id))
+                session.add(conversation)
+                session.flush()
+                conversation_id = str(conversation.id)
         else:
             # Create new conversation
             conversation = Conversation(user_id=UUID(user_id))

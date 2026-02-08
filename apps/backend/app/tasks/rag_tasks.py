@@ -811,9 +811,8 @@ def process_rag_query_task(
         if self.check_revoked(task_id):
             return {}
 
-        conversation_uuid = None
-        if conversation_id:
-            conversation_uuid = UUID(conversation_id)
+        # Use conversation_id from RAG result (service creates one if none was provided)
+        conversation_uuid = UUID(rag_result["conversation_id"])
 
         with SessionLocal() as session:
             # Step 0: Save user message

@@ -14,6 +14,7 @@ dependencies = [
   "pytest",
   "ruff",
   "black",
+  "notebook",
   "sqlalchemy[asyncio]",
   "psycopg",
   "asyncpg",

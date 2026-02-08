@@ -105,6 +105,61 @@ ClarityQL (the codebase powering AstraMind) is a production-grade monorepo that 
 - **infra**: Local development infrastructure via Docker Compose.
 - **scripts**: Seed utilities for initial data.
 
+## Tech Stack Used
+
+- **Frontend**: React + TypeScript (Vite), Tailwind CSS, Recharts, Zustand, React Query
+- **Backend**: FastAPI, Pydantic, SQLAlchemy, Celery, Uvicorn
+- **Database**: Postgres + pgvector
+- **RAG**: Sentence Transformers, pgvector similarity search
+- **Auth**: JWT
+- **Infra**: Docker Compose, Redis
+- **Testing**: Pytest
+
+## Default Models
+
+- **Default LLM**: Gemini `gemini-2.0-flash` (configurable via `LLMSettings` in `apps/backend/app/core/config.py`)
+- **Default Embedding Model**: `intfloat/multilingual-e5-large-instruct` (configurable via `EmbeddingSettings` in `apps/backend/app/core/config.py`)
+
+## System Design — NLQ Pipeline
+
+```mermaid
+flowchart LR
+    U["User Query"] --> API["FastAPI /api/nlq/query"]
+    API --> TQ["Task Queue (Celery)"]
+    TQ --> INT["Intent Classifier"]
+    INT --> PARSE["NLQ Parser (LLM)"]
+    PARSE --> AST["QueryAST"]
+    AST --> MERGE["AST Merge (conversation)"]
+    MERGE --> VALID["AST Validator"]
+    VALID --> JOIN["Join Resolver"]
+    JOIN --> SQL["SQL Compiler"]
+    SQL --> EXEC["SQL Execution"]
+    EXEC --> VIZ["Viz Inference"]
+    EXEC --> EXPL["Explainability Builder"]
+    VIZ --> RESP["SSE Result Stream"]
+    EXPL --> RESP
+    SQL --> RESP
+```
+
+## System Design — RAG Pipeline
+
+```mermaid
+flowchart LR
+    U["User Query"] --> API["FastAPI /api/rag/query"]
+    API --> TQ["Task Queue (Celery)"]
+    TQ --> EMB["Embedding Service"]
+    EMB --> VDB["pgvector Similarity Search"]
+    VDB --> CH["Top-K Chunks"]
+    CH --> LLM["Answer Generator (LLM)"]
+    LLM --> RESP["SSE Result Stream"]
+```
+
+## Future Plans
+
+- Enhance NLQ-to-AST parsing with new SQL method support
+- Introduce semantic caching for both NLQ and RAG pipelines
+- Improve RAG results using reranking
+
 ## Run Locally
 
 ### Prerequisites

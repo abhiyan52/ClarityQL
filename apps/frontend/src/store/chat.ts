@@ -8,6 +8,7 @@ interface ChatState {
   currentConversationId: string | null;
   isLoading: boolean;
   abortController: AbortController | null;
+  deleteError: string | null;
 
   // Actions
   loadConversations: () => Promise<void>;
@@ -17,6 +18,7 @@ interface ChatState {
   addMessage: (message: Omit<ChatMessage, "id" | "timestamp">) => string;
   updateMessage: (id: string, updates: Partial<ChatMessage>) => void;
   deleteConversation: (id: string) => Promise<void>;
+  clearDeleteError: () => void;
   setLoading: (loading: boolean) => void;
   setAbortController: (controller: AbortController | null) => void;
   cancelCurrentQuery: () => void;
@@ -32,6 +34,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   currentConversationId: null,
   isLoading: false,
   abortController: null,
+  deleteError: null,
 
   loadConversations: async () => {
     try {
@@ -200,11 +203,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ? conversations[0]?.id || null
             : state.currentConversationId;
 
-        return { conversations, currentConversationId };
+        return { conversations, currentConversationId, deleteError: null };
       });
     } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : "Failed to delete conversation";
       console.error("Failed to delete conversation", error);
+      set({ deleteError: errorMessage });
+      throw error;
     }
+  },
+
+  clearDeleteError: () => {
+    set({ deleteError: null });
   },
 
   setLoading: (loading) => {

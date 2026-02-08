@@ -183,7 +183,7 @@ export const useRAGChatStore = create<RAGChatState>((set, get) => ({
     },
 
     addMessage: (message) => {
-        const id = Date.now().toString();
+        const id = `${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
         const newMessage: RAGMessage = {
             ...message,
             id,

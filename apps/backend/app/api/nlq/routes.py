@@ -29,10 +29,13 @@ async def list_conversations(
     current_user: CurrentUser,
     session: AsyncSessionDep,
 ) -> list[dict]:
-    """List all conversations for the current user."""
+    """List all NLQ conversations for the current user."""
     result = await session.execute(
         select(Conversation)
-        .where(Conversation.user_id == current_user.id)
+        .where(
+            Conversation.user_id == current_user.id,
+            Conversation.conversation_type == "nlq"
+        )
         .order_by(desc(Conversation.updated_at))
     )
     conversations = result.scalars().all()
@@ -55,11 +58,14 @@ async def get_conversation(
     current_user: CurrentUser,
     session: AsyncSessionDep,
 ) -> dict:
-    """Get conversation details and messages."""
+    """Get NLQ conversation details and messages."""
     result = await session.execute(
         select(Conversation)
         .options(selectinload(Conversation.messages))
-        .where(Conversation.id == conversation_id)
+        .where(
+            Conversation.id == conversation_id,
+            Conversation.conversation_type == "nlq"
+        )
     )
     conversation = result.scalar_one_or_none()
     
@@ -100,9 +106,12 @@ async def delete_conversation(
     current_user: CurrentUser,
     session: AsyncSessionDep,
 ):
-    """Delete a conversation."""
+    """Delete an NLQ conversation."""
     result = await session.execute(
-        select(Conversation).where(Conversation.id == conversation_id)
+        select(Conversation).where(
+            Conversation.id == conversation_id,
+            Conversation.conversation_type == "nlq"
+        )
     )
     conversation = result.scalar_one_or_none()
     
@@ -154,7 +163,8 @@ async def submit_nlq_query(
         conversation = Conversation(
             user_id=current_user.id,
             title="New Conversation",
-            status=ConversationStatus.ACTIVE
+            status=ConversationStatus.ACTIVE,
+            conversation_type="nlq"
         )
         session.add(conversation)
         await session.commit()
@@ -163,7 +173,10 @@ async def submit_nlq_query(
     else:
         # Verify conversation exists and belongs to user
         result = await session.execute(
-            select(Conversation).where(Conversation.id == conversation_id)
+            select(Conversation).where(
+                Conversation.id == conversation_id,
+                Conversation.conversation_type == "nlq"
+            )
         )
         conversation = result.scalar_one_or_none()
         if not conversation:

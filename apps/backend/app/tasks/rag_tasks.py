@@ -284,10 +284,28 @@ def ingest_document_task(
                 overlap_tokens=request.chunk_overlap_tokens,
             )
 
-            document_title = (
-                request.document_title or loader.get_document_title(doc)
-            )
-            file_name = Path(request.file_path).name
+            # Extract original filename from the file path (format: {user_id}_{original_filename})
+            file_path_obj = Path(request.file_path)
+            file_name_with_prefix = file_path_obj.name
+            # Remove the user_id prefix to get the original filename
+            original_file_name = file_name_with_prefix.split('_', 1)[1] if '_' in file_name_with_prefix else file_name_with_prefix
+            # Remove file extension for title
+            original_title = original_file_name.rsplit('.', 1)[0] if '.' in original_file_name else original_file_name
+            
+            # Priority: 1) User-provided title, 2) Original filename (without ext), 3) Extracted from doc
+            extracted_title = loader.get_document_title(doc)
+            # Check if extracted title looks like a UUID (starts with UUID pattern)
+            import re
+            is_uuid_like = bool(re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', str(extracted_title), re.IGNORECASE))
+            
+            if request.document_title:
+                document_title = request.document_title
+            elif extracted_title and not is_uuid_like:
+                document_title = extracted_title
+            else:
+                document_title = original_title or "Untitled Document"
+            
+            file_name = original_file_name
 
             chunks = chunker.chunk_elements(
                 elements=elements,

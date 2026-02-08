@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Upload, FileText, Loader2, CheckCircle2, XCircle, Clock, ArrowLeft, Eye } from "lucide-react";
+import { Upload, FileText, Loader2, CheckCircle2, XCircle, Clock, Eye, PanelLeft, Moon, Sun, MessageSquare, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
+
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -21,8 +22,16 @@ export function DocumentsPage() {
 
   const [viewerOpen, setViewerOpen] = useState(false);
   const [viewerDocumentId, setViewerDocumentId] = useState<string | undefined>();
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [docLibraryOpen, setDocLibraryOpen] = useState(false);
+  const [darkMode, setDarkMode] = useState(false);
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+
+  const toggleDarkMode = () => {
+    setDarkMode(!darkMode);
+    document.documentElement.classList.toggle("dark");
+  };
 
   // Fetch documents
   const { data: documentsData, isLoading: isLoadingDocuments } = useQuery({
@@ -87,140 +96,201 @@ export function DocumentsPage() {
   ).length;
 
   return (
-    <div className="flex h-screen bg-background">
-      {/* Column 1 - Chat History */}
-      <div className="w-64 border-r bg-muted/20 hidden lg:flex flex-col">
-        <RAGSidebar />
-      </div>
-
-      {/* Column 2 - Document Management */}
-      <div className="w-80 border-r bg-muted/20 flex flex-col">
-        {/* Header */}
-        <div className="border-b bg-background p-4">
-          <div className="flex items-center gap-2 mb-3">
+    <div className={cn("flex h-screen flex-col bg-background", darkMode && "dark")}>
+      {/* Top Header */}
+      <header className="flex h-14 items-center justify-between border-b px-4 bg-background">
+        <div className="flex items-center gap-2">
+          {!sidebarOpen && (
             <Button
               variant="ghost"
               size="icon"
-              onClick={() => navigate("/")}
-              className="shrink-0"
+              onClick={() => setSidebarOpen(true)}
+              title="Show chat history"
             >
-              <ArrowLeft className="h-4 w-4" />
+              <PanelLeft className="h-4 w-4" />
             </Button>
-            <h1 className="text-xl font-semibold">Document Library</h1>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Upload and manage documents for RAG queries
-          </p>
+          )}
+          <h1 className="text-lg font-semibold">ClarityQL</h1>
+          <span className="rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary">
+            Beta
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button 
+            variant="ghost" 
+            size="sm" 
+            onClick={() => navigate("/")}
+            className="gap-2"
+          >
+            <MessageSquare className="h-4 w-4" />
+            NLQ Chat
+          </Button>
+          <Button 
+            variant="ghost" 
+            size="sm" 
+            onClick={() => setDocLibraryOpen(!docLibraryOpen)}
+            className="gap-2"
+          >
+            <FileText className="h-4 w-4" />
+            Documents
+          </Button>
+          <Button variant="ghost" size="icon" onClick={toggleDarkMode}>
+            {darkMode ? (
+              <Sun className="h-4 w-4" />
+            ) : (
+              <Moon className="h-4 w-4" />
+            )}
+          </Button>
+        </div>
+      </header>
+
+      {/* Main Content Area */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* Column 1 - Chat History (Collapsible) */}
+        <div
+          className={cn(
+            "border-r bg-muted/20 flex flex-col transition-all duration-300",
+            sidebarOpen ? "w-64" : "w-0 overflow-hidden"
+          )}
+        >
+          <RAGSidebar onClose={() => setSidebarOpen(false)} />
         </div>
 
-        {/* Upload Section */}
-        <div className="p-4 border-b">
-          <label htmlFor="file-upload">
-            <div className="cursor-pointer rounded-lg border-2 border-dashed border-muted-foreground/25 bg-background p-6 text-center hover:border-primary hover:bg-accent transition-colors">
-              <Upload className="h-8 w-8 mx-auto mb-2 text-muted-foreground" />
-              <p className="text-sm font-medium">Click to upload documents</p>
-              <p className="text-xs text-muted-foreground mt-1">
-                PDF, DOCX, TXT, MD supported
-              </p>
-            </div>
-            <input
-              id="file-upload"
-              type="file"
-              multiple
-              accept=".pdf,.docx,.txt,.md"
-              onChange={handleFileUpload}
-              className="hidden"
-              disabled={uploadMutation.isPending}
-            />
-          </label>
+        {/* Column 2 - Chat Window */}
+        <div className="flex-1 flex flex-col">
+          <RAGChatWindow
+            totalDocuments={readyCount}
+          />
         </div>
 
-        {/* Stats */}
-        <div className="p-4 border-b bg-background">
-          <div className="grid grid-cols-2 gap-2 text-sm">
-            <div className="flex items-center gap-2">
-              <CheckCircle2 className="h-4 w-4 text-green-600" />
-              <span className="text-muted-foreground">Ready:</span>
-              <span className="font-semibold">{readyCount}</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <Clock className="h-4 w-4 text-blue-600" />
-              <span className="text-muted-foreground">Processing:</span>
-              <span className="font-semibold">{processingCount}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Selection Controls */}
-        {readyCount > 0 && (
-          <div className="p-4 border-b bg-background">
-            <div className="flex gap-2 mb-2">
+        {/* Column 3 - Document Library (Collapsible, right side) */}
+        <div
+          className={cn(
+            "border-l bg-muted/20 flex flex-col transition-all duration-300",
+            docLibraryOpen ? "w-[400px]" : "w-0 overflow-hidden"
+          )}
+        >
+          {/* Header */}
+          <div className="border-b bg-background p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h1 className="text-xl font-semibold">Document Library</h1>
               <Button
-                size="sm"
-                variant="outline"
-                onClick={selectAllDocuments}
-                className="flex-1"
+                variant="ghost"
+                size="icon"
+                onClick={() => setDocLibraryOpen(false)}
+                className="h-8 w-8"
+                title="Close document library"
               >
-                Select All ({readyCount})
+                <X className="h-4 w-4" />
               </Button>
-              {selectedDocumentIds.length > 0 && (
+            </div>
+            <p className="text-sm text-muted-foreground">
+              Upload and manage documents for RAG queries
+            </p>
+          </div>
+
+          {/* Upload Section */}
+          <div className="p-4 border-b">
+            <label htmlFor="file-upload">
+              <div className="cursor-pointer rounded-lg border-2 border-dashed border-muted-foreground/25 bg-background p-6 text-center hover:border-primary hover:bg-accent transition-colors">
+                <Upload className="h-8 w-8 mx-auto mb-2 text-muted-foreground" />
+                <p className="text-sm font-medium">Click to upload documents</p>
+                <p className="text-xs text-muted-foreground mt-1">
+                  PDF, DOCX, TXT, MD supported
+                </p>
+              </div>
+              <input
+                id="file-upload"
+                type="file"
+                multiple
+                accept=".pdf,.docx,.txt,.md"
+                onChange={handleFileUpload}
+                className="hidden"
+                disabled={uploadMutation.isPending}
+              />
+            </label>
+          </div>
+
+          {/* Stats */}
+          <div className="p-4 border-b bg-background">
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <div className="flex items-center gap-2">
+                <CheckCircle2 className="h-4 w-4 text-green-600" />
+                <span className="text-muted-foreground">Ready:</span>
+                <span className="font-semibold">{readyCount}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <Clock className="h-4 w-4 text-blue-600" />
+                <span className="text-muted-foreground">Processing:</span>
+                <span className="font-semibold">{processingCount}</span>
+              </div>
+            </div>
+          </div>
+
+          {/* Selection Controls */}
+          {readyCount > 0 && (
+            <div className="p-4 border-b bg-background">
+              <div className="flex gap-2 mb-2">
                 <Button
                   size="sm"
                   variant="outline"
-                  onClick={clearSelection}
+                  onClick={selectAllDocuments}
                   className="flex-1"
                 >
-                  Clear ({selectedDocumentIds.length})
+                  Select All ({readyCount})
+                </Button>
+                {selectedDocumentIds.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={clearSelection}
+                    className="flex-1"
+                  >
+                    Clear ({selectedDocumentIds.length})
+                  </Button>
+                )}
+              </div>
+              {(selectedDocumentIds.length > 0 || readyCount > 0) && (
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => openViewer(selectedDocumentIds[0])}
+                  className="w-full gap-2"
+                >
+                  <Eye className="h-4 w-4" />
+                  View {selectedDocumentIds.length > 0 ? `Selected (${selectedDocumentIds.length})` : `All (${readyCount})`}
                 </Button>
               )}
             </div>
-            {(selectedDocumentIds.length > 0 || readyCount > 0) && (
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => openViewer(selectedDocumentIds[0])}
-                className="w-full gap-2"
-              >
-                <Eye className="h-4 w-4" />
-                View {selectedDocumentIds.length > 0 ? `Selected (${selectedDocumentIds.length})` : `All (${readyCount})`}
-              </Button>
-            )}
-          </div>
-        )}
+          )}
 
-        {/* Documents List */}
-        <ScrollArea className="flex-1">
-          <div className="p-4 space-y-2">
-            {isLoadingDocuments ? (
-              <div className="flex items-center justify-center py-8">
-                <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
-              </div>
-            ) : documents.length === 0 ? (
-              <div className="text-center py-8 text-muted-foreground">
-                <FileText className="h-12 w-12 mx-auto mb-2 opacity-50" />
-                <p className="text-sm">No documents yet</p>
-                <p className="text-xs mt-1">Upload your first document to get started</p>
-              </div>
-            ) : (
-              documents.map(doc => (
-                <DocumentCard
-                  key={doc.id}
-                  document={doc}
-                  isSelected={selectedDocumentIds.includes(doc.id)}
-                  onToggleSelect={() => handleToggleSelect(doc.id)}
-                  onView={() => openViewer(doc.id)}
-                />
-              ))
-            )}
-          </div>
-        </ScrollArea>
-      </div>
-
-      <div className="flex-1 flex flex-col">
-        <RAGChatWindow
-          totalDocuments={readyCount}
-        />
-      </div>
+          {/* Documents List */}
+          <ScrollArea className="flex-1">
+            <div className="p-4 space-y-2">
+              {isLoadingDocuments ? (
+                <div className="flex items-center justify-center py-8">
+                  <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
+                </div>
+              ) : documents.length === 0 ? (
+                <div className="text-center py-8 text-muted-foreground">
+                  <FileText className="h-12 w-12 mx-auto mb-2 opacity-50" />
+                  <p className="text-sm">No documents yet</p>
+                  <p className="text-xs mt-1">Upload your first document to get started</p>
+                </div>
+              ) : (
+                documents.map(doc => (
+                  <DocumentCard
+                    key={doc.id}
+                    document={doc}
+                    isSelected={selectedDocumentIds.includes(doc.id)}
+                    onToggleSelect={() => handleToggleSelect(doc.id)}
+                    onView={() => openViewer(doc.id)}
+                  />
+                ))
+              )}
+            </div>
+          </ScrollArea>
+        </div>
 
       {/* Document Viewer Modal */}
       {viewerOpen && (
@@ -234,6 +304,7 @@ export function DocumentsPage() {
         />
       )}
     </div>
+  </div>
   );
 }
 
@@ -279,8 +350,16 @@ function DocumentCard({ document, isSelected, onToggleSelect, onView }: Document
         </div>
 
         {/* Content */}
-        <div className="flex-1 min-w-0" onClick={() => isReady && onToggleSelect()}>
-          <h3 className="font-medium text-sm truncate">{document.title}</h3>
+        <div className="flex-1 min-w-0 overflow-hidden" onClick={() => isReady && onToggleSelect()}>
+          <div className="relative group/title">
+            <h3 className="font-medium text-sm truncate" title={document.file_name || document.title}>
+              {document.file_name || document.title}
+            </h3>
+            {/* Tooltip for truncated filename */}
+            <div className="absolute left-0 top-full mt-1 px-2 py-1 bg-gray-900 text-white text-xs rounded opacity-0 invisible group-hover/title:opacity-100 group-hover/title:visible transition-opacity duration-200 z-50 whitespace-nowrap max-w-[300px] overflow-hidden text-ellipsis">
+              {document.file_name || document.title}
+            </div>
+          </div>
           {document.description && (
             <p className="text-xs text-muted-foreground line-clamp-2 mt-0.5">
               {document.description}

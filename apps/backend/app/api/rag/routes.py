@@ -37,6 +37,27 @@ UPLOAD_DIR = Path("/tmp/clarityql_uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _extract_original_filename(storage_path: str | None) -> str | None:
+    """
+    Extract the original filename from storage path.
+    
+    Storage path format: {user_id}_{original_filename}
+    Example: /tmp/clarityql_uploads/550e8400-e29b-41d4-a716-446655440000_report.pdf
+    Returns: report.pdf
+    """
+    if not storage_path:
+        return None
+    # Get the basename (filename part)
+    basename = storage_path.split("/")[-1]
+    # Remove the user_id prefix (UUID followed by underscore)
+    # UUID format: 8-4-4-4-12 hex characters (but be flexible with last segment)
+    import re
+    match = re.match(r'^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]+)_(.+)', basename, re.IGNORECASE)
+    if match:
+        return match.group(2)
+    return basename
+
+
 # ──────────────────────────────────────────────
 # Request/Response Schemas
 # ──────────────────────────────────────────────
@@ -866,6 +887,7 @@ async def list_documents(
                 {
                     "id": str(doc.id),
                     "title": doc.title,
+                    "file_name": _extract_original_filename(doc.storage_path),
                     "description": doc.description,
                     "language": doc.language,
                     "chunk_count": doc.chunk_count,
@@ -920,6 +942,7 @@ async def get_document(
         content={
             "id": str(document.id),
             "title": document.title,
+            "file_name": _extract_original_filename(document.storage_path),
             "description": document.description,
             "language": document.language,
             "chunk_count": document.chunk_count,

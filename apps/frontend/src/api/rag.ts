@@ -11,6 +11,7 @@ function getAuthToken(): string | null {
 export interface Document {
   id: string;
   title: string;
+  file_name?: string;
   description?: string;
   language: string;
   chunk_count: number;
